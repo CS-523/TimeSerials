@@ -18,6 +18,7 @@ src/
 ├── train_forecaster.py             # ★ 训练循环（支持变 in_len/out_len/起点）
 ├── optimize.py                     # ★ 控制优化：固定过去 → 搜索 x3/x4/x6/x8 → 最大化 y4
 ├── visualize.py                    # ★ 可视化：x1-x8 预测、y1-y4 预测、优化前后对比
+├── per_file_prediction_stats.py    # ★ 每个文件的预测偏差统计（按文件夹分组）
 ├── make_report.py                  # ★ 生成综合 Markdown 报告 (REPORT.md)
 │
 ├── REPORT.md                       # 由 make_report.py 生成
@@ -113,6 +114,20 @@ python src/visualize.py
 - `forecast_x1_x8.png` — 真实 vs 预测的 x1-x8
 - `error_per_dim.png` — 分维度 RMSE 柱状图
 
+### 5.5. 每个文件预测偏差统计（按文件夹分组）
+
+```bash
+python src/per_file_prediction_stats.py
+```
+
+**输出**（`src/analysis_out/`）：
+- `per_file_rmse_boxplot.png` — 按文件夹（dir 1-5）分组的整体 RMSE 箱线图
+- `per_file_rmse_scatter.png` — 每个文件的散点图（按 group 着色，标出 dir 区间）
+- `per_dim_rmse_boxplot.png` — 8 个维度按文件夹分箱的误差分布
+
+**用途**：发现哪些文件/哪些维度预测差。
+本项目实证结论：dir 4（绿色）最差，x4 / x5 这两个维度最难预测。
+
 ### 6. 生成综合报告
 
 ```bash
@@ -129,6 +144,7 @@ python src/make_report.py
 python src/analyze.py \
   && python src/train_forecaster.py --epochs 30 \
   && python src/visualize.py \
+  && python src/per_file_prediction_stats.py \
   && python src/make_report.py
 ```
 
@@ -176,7 +192,10 @@ data_loader.py ──┬──> analyze.py ────────> analysis_ou
                                                        │
 model_forecaster.py <──── train_forecaster.py           │
                                                        ▼
-                                                  visualize.py ──> analysis_out/*.png
+                                                  visualize.py ──> analysis_out/forecast_*.png
+                                                       │
+                                                       ▼
+                                per_file_prediction_stats.py ──> analysis_out/per_file_*.png
                                                        │
                                                        ▼
                                                 make_report.py ──> REPORT.md
