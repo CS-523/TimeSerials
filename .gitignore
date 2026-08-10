@@ -1,0 +1,112 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.python-version
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ===== Data Science =====
+# 模型输出与中间产物（按需取消注释）
+# *.pkl
+# *.pickle
+# *.h5
+# *.joblib
+# *.model
+
+# 大型数据文件（原始数据已存在于 1/ 2/ 3/ 4/ 5/ 目录，如需忽略请取消注释）
+# *.csv
+# *.xlsx
+# *.parquet
+
+# Tensorboard / 训练日志
+runs/
+logs/
+events.out.tfevents.*
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.spyderproject
+
+# ===== OS =====
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSSharedFileList
+
+# Linux
+*~
+.directory
+
+# ===== Logs & Temporary =====
+*.log
+*.tmp
+*.bak
+*.cache
+
+# ===== Environment & Secrets =====
+.env
+.env.local
+*.secret
+credentials.json
+
+# ===== Project: artifacts & cache =====
+# 原始数据（用户选 "只跟踪代码+文档"，原始 csv 仍保留在硬盘上不入库）
+/1/*.csv
+/2/*.csv
+/3/*.csv
+/4/*.csv
+/5/*.csv
+
+# 模型 checkpoint
+*.pt
+*.pth
+*.ckpt
+
+# pytest / python 缓存
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行产物
+checkpoints/
+data/processed/
+results/figures/
+results/metrics/
+results/predictions/
+
+# src/model_out/ 中的大文件（~9MB .pt + ~400KB npz）；保留 src/model_out/.gitkeep 以便目录入库
+src/model_out/forecaster_best.pt
+src/model_out/test_predictions.npz
+src/model_out/scalers.npz
