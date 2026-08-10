@@ -221,6 +221,12 @@ def main():
                 "x_scaler": {"mean": x_scaler.mean, "std": x_scaler.std},
                 "args": vars(args),
             }, os.path.join(args.out_dir, "forecaster_best.pt"))
+            # 同时按模型名保存一份，便于多模型对比
+            torch.save({
+                "model": model.state_dict(),
+                "x_scaler": {"mean": x_scaler.mean, "std": x_scaler.std},
+                "args": vars(args),
+            }, os.path.join(args.out_dir, f"forecaster_{args.model}.pt"))
             print(f"  -> saved best (rmse_x={best_val:.4f})")
 
     # 测试
