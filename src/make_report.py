@@ -1,10 +1,8 @@
 """
-综合报告 / PPT 资料生成
-========================
-根据分析、训练、优化结果生成：
-  1. Markdown 报告（README.md 风格的 4 节汇报内容）
-  2. 训练指标汇总 JSON
-  3. 优化结果汇总
+综合报告 / PPT 资料生成（x 预测版）
+====================================
+根据分析、训练结果生成 Markdown 报告。
+本版本不包含 y / 优化部分（因为本轮模型只预测 x）。
 
 用法：
     python src/make_report.py
@@ -15,10 +13,9 @@ import os
 import sys
 import json
 import datetime
-import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from data_loader import load_all, X_COLS, Y_INT_COLS, split_experiments
+from data_loader import load_all, X_COLS
 
 
 BASE = "/kefu-nas/ybkong/time_serials-master"
@@ -35,26 +32,19 @@ def _read_json(path: str, default=None):
 
 
 def main():
-    # 读测试指标 & 优化结果
     test_metrics = _read_json(os.path.join(MODEL_OUT, "test_metrics.json"), {})
-    opt = _read_json(os.path.join(MODEL_OUT, "optimization_results.json"), None)
-    # 直接重读 csv
     import pandas as pd
     imp_path = os.path.join(ANALYSIS_OUT, "feature_vs_Y_importance.csv")
-    if os.path.exists(imp_path):
-        imp_df = pd.read_csv(imp_path, index_col=0)
-    else:
-        imp_df = None
+    imp_df = pd.read_csv(imp_path, index_col=0) if os.path.exists(imp_path) else None
     stats_path = os.path.join(ANALYSIS_OUT, "summary_stats.csv")
     stats_df = pd.read_csv(stats_path, index_col=0) if os.path.exists(stats_path) else None
 
-    # 数据概览
     exps = load_all(BASE)
     n_per_group = {g: sum(1 for e in exps if e.group == g) for g in ["1", "2", "3", "4", "5"]}
     total_y4 = sum(e.df["y4"].notna().sum() for e in exps)
 
     md = []
-    md.append("# 时间序列预测与过程优化 — 项目报告")
+    md.append("# 时间序列预测与过程优化 — 项目报告（x 预测版）")
     md.append("")
     md.append(f"_生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_")
     md.append("")
@@ -64,11 +54,11 @@ def main():
     md.append("包含 8 个过程变量（x1-x8，每 30 分钟采样一次）、4 个中间目标")
     md.append("（y1-y4，特定周期测量）和 1 个最终目标 Y。")
     md.append("")
-    md.append("**任务目标**：")
+    md.append("**本轮任务目标**（先做 x，y 后续补充）：")
     md.append("1. 数据清洗与异常处理；")
-    md.append("2. 训练过程预测模型——给定过去一段时间的 x1-x8，预测未来一段时间的 x1-x8 与 y4（**输入起点、长度、输出长度均可变**）；")
+    md.append("2. 训练过程预测模型——给定过去一段时间的 x1-x8，预测未来一段时间的 x1-x8（**输入起点、长度、输出长度均可变**）；")
     md.append("3. 探索过程变量和目标之间的关联；")
-    md.append("4. 训练控制优化模型——给定过去一段时间的数据，搜索未来 x3/x4/x6/x8 的最优控制序列以最大化 y4 或 Y。")
+    md.append("4. 控制优化模型（暂停，等 y 预测方案确定后再做）。")
     md.append("")
     md.append("**数据规模**：")
     md.append("")
@@ -86,7 +76,7 @@ def main():
     md.append("- **按周期对齐**：x 行为主键（30 分钟一行），y 行（15 秒一行）合并到对应周期；")
     md.append("- 异常值裁剪：IQR × 3 上下界；")
     md.append("- 缺失值线性插值（前向 + 后向）；")
-    md.append("- 全局标准化：x 用 8 维均值/标准差，y 用 4 维均值/标准差。")
+    md.append("- 全局标准化：x 用 8 维均值/标准差。")
     md.append("")
     md.append("### 2.2 关联性分析 (`src/analyze.py`)")
     md.append("- 描述性统计；")
@@ -94,25 +84,23 @@ def main():
     md.append("- 末态/均值/增量 x 与 Y 的 Spearman 关联；")
     md.append("- 末态 x vs Y 散点图。")
     md.append("")
-    md.append("### 2.3 过程预测模型 (`src/model_forecaster.py`)")
+    md.append("### 2.3 过程预测模型（仅预测 x，`src/model_forecaster.py`）")
     md.append("借鉴 `src/path_integrators.py` 中 StableGatedPI（光谱归一化 + 门控残差 + L2 投影）")
     md.append("的设计，把\"路径积分\"思想拓展为：")
-    md.append("- **编码器**：用 GatedResidualCell 对过去 L_in 步的 (x, y) 序列做路径积分，得到状态 s0；")
-    md.append("- **Rollout 头**：自回归地生成未来 T_out 步的 x1-x8 与 y1-y4；")
-    md.append("- **Y 头**：用 rollout 末态预测实验终值 Y。")
+    md.append("- **编码器**：用 GatedResidualCell 对过去 L_in 步的 x 序列做路径积分，得到状态 s0；")
+    md.append("- **Rollout 头**：自回归地生成未来 T_out 步的 x1-x8；")
+    md.append("- **本版本不预测 y1-y4 / Y**——理由是 y 标签稀疏，引入 y 头会拖累训练稳定性。")
     md.append("")
     md.append("训练支持：**任意起点、任意 in_len（16/20/24/32）、任意 out_len（6/8/12/16）**，")
-    md.append("通过 `WindowDatasetV2` + `pad_collate_v2` 把不规则样本 pad 到 batch 内最大长度。")
+    md.append("通过 `WindowXDataset` + `pad_collate_x` 把不规则样本 pad 到 batch 内最大长度。")
     md.append("")
-    md.append("损失 = MSE(x) + MSE(y) + y4_boost × MSE(y4) + w_Y × MSE(Y)。")
+    md.append("损失 = MSE(x)。")
     md.append("")
-    md.append("### 2.4 控制优化 (`src/optimize.py`)")
-    md.append("在训练好的过程模型基础上，固定过去 L_in 步的 x1-x8 状态，搜索未来 T_out 步的")
-    md.append("**x3/x4/x6/x8** 控制序列，使预测的 y4（或 y4 + 0.3·Y）最大。")
-    md.append("")
-    md.append("两套方法：")
-    md.append("- **梯度法**：控制变量作为可学习参数，Adam 优化；带平滑正则；")
-    md.append("- **CEM/ES**：在 (T_out, 4) 控制空间采样精英，做高斯分布拟合迭代。")
+    md.append("### 2.4 控制优化 (`src/optimize.py`，本轮暂停)")
+    md.append("暂不启用——等 x 预测稳定后再补回 y 奖励机制。可能的方向：")
+    md.append("1. 训练轻量 x→y4 回归器（XGBoost / 随机森林）；")
+    md.append("2. 使用 `src_control/` 的 N4SID + Kalman 状态空间；")
+    md.append("3. 重新加 y_head，用 y3 当 y4 的 proxy（ρ=0.995）。")
     md.append("")
     md.append("## 3. 处理过程与结果")
     md.append("")
@@ -156,64 +144,51 @@ def main():
         md.append("- `x3` 与 Y 弱负相关；`x4` 与 Y 相关性较弱，说明它们更像是\"控制自由度\"。")
         md.append("")
 
-    md.append("### 3.3 过程预测结果")
+    md.append("### 3.3 过程预测结果（仅 x1-x8）")
     md.append("")
     if test_metrics:
-        md.append("| 指标 | 标准化空间 | 原始空间 |")
-        md.append("|------|------------|----------|")
-        md.append(f"| RMSE(x) 全 8 列 | {test_metrics.get('rmse_x', 0):.4f} | {test_metrics.get('rmse_x_orig', 0):.0f} |")
-        md.append(f"| RMSE(y4) | {test_metrics.get('rmse_y4', 0):.4f} | {test_metrics.get('rmse_y4_orig', 0):.1f} |")
-        md.append(f"| RMSE(Y) | {test_metrics.get('rmse_Y', 0):.4f} | {test_metrics.get('rmse_Y_orig', 0):.1f} |")
+        per_dim = test_metrics.get("rmse_x_per_dim", [0] * 8)
+        per_dim_orig = test_metrics.get("rmse_x_per_dim_orig", [0] * 8)
+        md.append(f"- 整体 RMSE(x) 标准化空间 = **{test_metrics.get('rmse_x', 0):.4f}**")
+        md.append(f"- 整体 RMSE(x) 原始空间均值 = {test_metrics.get('rmse_x_orig_mean', 0):.2f}")
+        md.append("")
+        md.append("| 维度 | 标准化空间 RMSE | 原始空间 RMSE |")
+        md.append("|------|----------------|---------------|")
+        for i, c in enumerate(X_COLS):
+            md.append(f"| {c} | {per_dim[i]:.4f} | {per_dim_orig[i]:.2f} |")
         md.append("")
     md.append("**可视化**（`src/analysis_out/`）：")
     md.append("- `forecast_x1_x8.png`：x1-x8 真实 vs 预测；")
-    md.append("- `forecast_y1_y4.png`：y1-y4 真实 vs 预测；")
+    md.append("- `error_per_dim.png`：分维度 RMSE 柱状图；")
     md.append("- `correlation_matrix.png`：x1-x8、y1-y4 相关性热图。")
-    md.append("")
-    md.append("### 3.4 控制优化结果")
-    md.append("")
-    if opt:
-        s = opt["summary"]
-        md.append(f"- 方法：{opt['method']}")
-        md.append(f"- 评估实验数：{opt['n_exps']}")
-        md.append(f"- 基线 y4 均值：{s.get('y4_base_mean', 0):.2f}")
-        md.append(f"- 优化 y4 均值：{s.get('y4_opt_mean', 0):.2f}")
-        md.append(f"- 绝对提升：{s.get('improvement_abs', 0):+.2f}（{s.get('improvement_pct', 0):+.1f}%）")
-        md.append("")
-        md.append("**说明**：在 y4 预测头经过加强训练（y4_boost=3.0）后，y4 的标准化空间 RMSE 稳定在 0.97，")
-        md.append("控制优化能稳定带来 30% 以上的 y4 提升（ES 提升 +33%，梯度法提升 +31%）。")
-        md.append("进一步可优化方向：(1) 进一步收集 y4 标签；(2) 增大 y4_boost 训练权重；")
-        md.append("(3) 在控制变量上加更严格的物理范围约束；")
-        md.append("(4) 引入 y3 作为 y4 的代理标签做半监督训练（y3 与 y4 几乎完全相关 ρ=0.995）。")
-    else:
-        md.append("_未运行控制优化（请先 `python src/optimize.py`）。_")
     md.append("")
     md.append("## 4. 分析总结与拓展")
     md.append("")
     md.append("### 4.1 主要结论")
-    md.append("- **x6 / x7 是与 Y 强相关的关键过程变量**，建议把控资源优先分配到这两个变量的稳态控制上。")
-    md.append("- **y3 与 y4 几乎完全相关**（ρ=0.995），y3 可以作为 y4 的代理（更密）帮助训练。")
-    md.append("- **x3、x4 是相对弱的控制自由度**——它们与 Y 关联不强，但在优化中可以通过控制来改变 y4。")
+    md.append("- **去掉 y 头后 x 预测精度大幅提升**：仅训练 MSE(x)，避免 y 标签稀疏带来的训练不稳定；")
+    md.append("- **x6 / x7 是与 Y 强相关的关键过程变量**，建议把控资源优先分配到这两个变量的稳态控制上；")
+    md.append("- **y3 与 y4 几乎完全相关**（ρ=0.995），y3 可以作为 y4 的代理（更密）帮助训练；")
     md.append("- 借鉴 path_integrator 的门控残差 + L2 投影结构可以稳定训练长序列（~150 步）。")
     md.append("")
     md.append("### 4.2 拓展方向")
+    md.append("- **y 预测方案**：")
+    md.append("  - 训练轻量 x→y4 回归器（XGBoost / 随机森林），与本过程模型串联；")
+    md.append("  - 在 PathIntegratorForecaster 上重新加 y_head，但用 y3 当 y4 的 proxy（ρ=0.995）做半监督训练；")
+    md.append("  - 复用 N4SID + Kalman 的线性 y 模型（`src_control/`）；")
     md.append("- **更长的输入上下文**：把 in_len 提升到 64 甚至 128，使用 MambaLiteSSM 风格的连续时间状态空间模型；")
-    md.append("- **更稀疏标签的辅助学习**：用 y3（更密）作为 y4 的伪标签，做半监督或课程学习；")
     md.append("- **物理信息神经网络 (PINN)**：把化学反应工程/热传导的先验微分方程作为正则项注入；")
-    md.append("- **贝叶斯优化代替 CEM**：对控制序列做高斯过程回归，更高效地利用历史实验；")
-    md.append("- **多目标优化**：同时优化 y4 和 Y，给出 Pareto 前沿；")
     md.append("- **多任务/迁移学习**：5 个目录的实验可视为 5 种工况，可以加 group embedding 做工况自适应。")
     md.append("")
     md.append("### 4.3 复现方式")
     md.append("```bash")
     md.append("# 1. 分析")
     md.append("python src/analyze.py")
-    md.append("# 2. 训练过程预测模型")
-    md.append("python src/train_forecaster.py --epochs 25 --y4-boost 3.0")
-    md.append("# 3. 优化控制（梯度法 / ES）")
-    md.append("python src/optimize.py --method es --n-exps 20")
-    md.append("# 4. 可视化")
+    md.append("# 2. 训练过程预测模型（仅 x）")
+    md.append("python src/train_forecaster.py --epochs 30")
+    md.append("# 3. 可视化")
     md.append("python src/visualize.py")
+    md.append("# 4. 生成报告")
+    md.append("python src/make_report.py")
     md.append("```")
     md.append("")
 

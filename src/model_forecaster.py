@@ -1,6 +1,6 @@
 """
-过程预测模型：Path-Integrator-based Sequence Forecaster
-========================================================
+过程预测模型：Path-Integrator-based Sequence Forecaster（仅预测 x1-x8）
+=====================================================================
 设计思路（借鉴 path_integrators.py 中的 StableGatedPI / ResidualPI）：
   1. 用一个"输入编码器"把过去 L_in 步的 x 序列编码成一个 state vector s0；
      编码器内部使用类 StableGatedPI 的"门控残差 + L2 投影"路径积分结构，
@@ -8,15 +8,11 @@
   2. 之后用"自回归 rollout"产生未来 T_out 步的 x1-x8：
      每步把当前 state 过一个 transition 模块得到 Δx_t，
      再把 (state, Δx) 送进一个"读出网络"得到下一步 x。
-  3. 同时维护一个"中间目标读出头" y_head，把每步 state 解码到 y1-y4 的预测
-     （y4 必选，y1-y3 可选）。
-  4. 整个模型可处理"任意起点 / 任意输入长度 / 任意输出长度"：
-     输入端用 attention pooling 得到 s0，输出端自回归至目标步数即停。
+  3. **本版本只预测 x1-x8，不预测 y1-y4 / Y**——理由是 y 标签稀疏（y4 每 ~24 步
+     才出现一次），引入 y 头会拖累训练稳定性。先把 x 预测做精，后续再单独考虑 y。
 
 训练损失：
   - 过程预测主任务：MSE on x（输出窗口的 8 列）
-  - 中间目标辅助任务：MSE on y4（y1-y3 缺失太多，只在有标签处算）
-  - 终值监督：Y 预测头（用末态 s_last 接 MLP）→ MSE
 
 参考：
   - path_integrators.StableGatedPI：spectral_norm + 门控残差 + L2 投影
@@ -98,32 +94,23 @@ class ContinuousTimeCell(nn.Module):
 # ===================== 主模型 =====================
 class PathIntegratorForecaster(nn.Module):
     """
-    输入：past_x (B, L_in, 8) + past_y (B, L_in, 4) （y 缺失位置 0）
-    输出：
-        pred_x : (B, T_out, 8)
-        pred_y : (B, T_out, 4)    # y4 是必选
-        pred_Y : (B, 1)
+    输入：past_x (B, L_in, 8)
+    输出：pred_x (B, T_out, 8)   —— 仅预测过程变量 x1-x8，不预测 y1-y4 / Y
     """
-    def __init__(self, dim_x: int = 8, dim_y: int = 4,
-                 dim_state: int = 128, hidden: int = 128):
+    def __init__(self, dim_x: int = 8, dim_state: int = 128, hidden: int = 128):
         super().__init__()
         self.dim_x = dim_x
-        self.dim_y = dim_y
         self.dim_state = dim_state
 
-        # 输入编码：x 单独编码为动作 a_t（与 StableGatedPI 输入对齐）
+        # 输入编码：x → 隐藏向量作为路径积分的 action a_t
         self.x_proj = nn.Linear(dim_x, hidden)
-        self.y_proj = nn.Linear(dim_y, hidden)
-        # 拼接后降维为 action_dim
         self.action_dim = hidden
-        # 路径积分单元
+        # 路径积分单元（借鉴 StableGatedPI：spectral_norm + 门控残差 + L2 投影）
         self.gated_cell = GatedResidualCell(self.action_dim, dim_state, hidden=hidden)
-        # 用于输出的连续时间单元
+        # 连续时间单元（借鉴 MambaLiteSSM）
         self.cont_cell = ContinuousTimeCell(self.action_dim, dim_state, hidden=hidden)
         # 初始状态
         self.s0 = nn.Parameter(torch.randn(dim_state) * 0.02)
-        # attention pooling（输入序列 → 单一初始 state）
-        self.pool_q = nn.Parameter(torch.randn(dim_state) * 0.02)
 
         # rollout head：state + 上一步 x → 下一步 x
         self.x_head = nn.Sequential(
@@ -131,30 +118,16 @@ class PathIntegratorForecaster(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, dim_x),
         )
-        # y head：state + x → y1-y4
-        self.y_head = nn.Sequential(
-            nn.Linear(dim_state + dim_x, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, dim_y),
-        )
-        # Y head：用 rollout 末态 s 预测
-        self.Y_head = nn.Sequential(
-            nn.Linear(dim_state + dim_x, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, 1),
-        )
 
     # ---------- 输入编码（过去 L_in 步的 path integrator）----------
-    def encode(self, past_x: torch.Tensor, past_y: torch.Tensor) -> torch.Tensor:
+    def encode(self, past_x: torch.Tensor) -> torch.Tensor:
         """
-        past_x: (B, L, 8); past_y: (B, L, 4) — 缺失位填 0 + mask
+        past_x: (B, L, 8)
         返回 s0: (B, dim_state)
         """
         B, L, _ = past_x.shape
-        a = self.x_proj(past_x) + self.y_proj(past_y)  # (B, L, hidden)
-        # attention pooling 得到 query
-        q = self.pool_q.expand(B, -1)                    # (B, D)
-        # 用一个"循环扫描"得到每个时刻的 s
+        a = self.x_proj(past_x)                            # (B, L, hidden)
+        # 循环扫描
         s = F.normalize(self.s0, dim=-1).expand(B, -1)
         h = torch.zeros(B, self.dim_state, device=past_x.device)
         last_s = s
@@ -162,63 +135,46 @@ class PathIntegratorForecaster(nn.Module):
             s = self.gated_cell(s, a[:, t])
             h = self.cont_cell(h, a[:, t])
             last_s = s
-        # attention pool：把 L 个时刻 s 拼起来太重，这里用末态 s 略加
-        # 实际上我们已经让循环把整个序列吃进 last_s；进一步用 attention
-        # 让模型可以学会"以任意起点为锚"——但为了实现简洁，先用末态
         s0 = last_s + 0.1 * h
         return s0
 
-    def encode_with_state(self, past_x: torch.Tensor, past_y: torch.Tensor):
-        """与 encode 一样，但额外返回 s_init（用于 rollout）。"""
-        return self.encode(past_x, past_y)
-
     # ---------- 自回归 rollout ----------
     @torch.no_grad()
-    def rollout(self, past_x: torch.Tensor, past_y: torch.Tensor, T_out: int) -> tuple:
-        """推理时 rollout T_out 步；返回 (pred_x, pred_y) 均为 (B, T_out, ...)"""
+    def rollout(self, past_x: torch.Tensor, T_out: int) -> torch.Tensor:
+        """推理时 rollout T_out 步；返回 pred_x (B, T_out, 8)。"""
         self.eval()
-        return self._rollout(past_x, past_y, T_out)
+        return self._rollout(past_x, T_out)
 
-    def _rollout(self, past_x: torch.Tensor, past_y: torch.Tensor, T_out: int) -> tuple:
-        s = self.encode(past_x, past_y)                 # (B, D)
-        # 取输入末步 x 作为第一步输入
-        x_last = past_x[:, -1, :]                       # (B, 8)
-        pred_x, pred_y = [], []
+    def _rollout(self, past_x: torch.Tensor, T_out: int) -> torch.Tensor:
+        s = self.encode(past_x)                            # (B, D)
+        x_last = past_x[:, -1, :]                          # (B, 8)
+        pred_x = []
         for t in range(T_out):
             inp = torch.cat([s, x_last], dim=-1)
             dx = self.x_head(inp)
-            y_t = self.y_head(inp)
-            x_next = x_last + dx                        # 残差式预测
+            x_next = x_last + dx                           # 残差式预测
             pred_x.append(x_next)
-            pred_y.append(y_t)
             x_last = x_next
-            # s 自更新：把 (s, x_next, y_t) 重新积分一步
-            a = self.x_proj(x_next) + self.y_proj(y_t)
+            # s 自更新
+            a = self.x_proj(x_next)
             s = self.gated_cell(s, a)
-        pred_x = torch.stack(pred_x, dim=1)             # (B, T, 8)
-        pred_y = torch.stack(pred_y, dim=1)             # (B, T, 4)
-        return pred_x, pred_y
+        pred_x = torch.stack(pred_x, dim=1)                # (B, T, 8)
+        return pred_x
 
-    def forward(self, past_x: torch.Tensor, past_y: torch.Tensor, T_out: int) -> dict:
-        s = self.encode(past_x, past_y)
+    def forward(self, past_x: torch.Tensor, T_out: int) -> dict:
+        s = self.encode(past_x)
         x_last = past_x[:, -1, :]
-        pred_x, pred_y = [], []
+        pred_x = []
         for t in range(T_out):
             inp = torch.cat([s, x_last], dim=-1)
             dx = self.x_head(inp)
-            y_t = self.y_head(inp)
             x_next = x_last + dx
             pred_x.append(x_next)
-            pred_y.append(y_t)
             x_last = x_next
-            a = self.x_proj(x_next) + self.y_proj(y_t)
+            a = self.x_proj(x_next)
             s = self.gated_cell(s, a)
         pred_x = torch.stack(pred_x, dim=1)
-        pred_y = torch.stack(pred_y, dim=1)
-        # Y 预测
-        y_last = pred_y[:, -1, :]
-        pred_Y = self.Y_head(torch.cat([s, x_last], dim=-1))
-        return {"pred_x": pred_x, "pred_y": pred_y, "pred_Y": pred_Y}
+        return {"pred_x": pred_x}
 
 
 # ===================== 训练/评估工具 =====================
