@@ -106,6 +106,9 @@ results/figures/
 results/metrics/
 results/predictions/
 
+# ===== Office 临时文件 =====
+~$*
+
 # src/model_out/ 中的大文件（~9MB .pt + ~400KB npz）；保留 src/model_out/.gitkeep 以便目录入库
 src/model_out/forecaster_best.pt
 src/model_out/test_predictions.npz

@@ -1,6 +1,6 @@
 # `src/` — 时间序列预测 + 过程优化
 
-本目录包含项目的核心代码（数据加载、关联分析、过程预测模型、训练、控制优化、可视化、报告生成）。  
+本目录包含项目的核心代码（数据加载、关联分析、过程预测模型、训练、控制优化、可视化、报告生成）。
 所有脚本都设计为可直接 `python <script.py>` 运行，复现实验只需按下列顺序执行几条命令。
 
 ---
@@ -61,6 +61,7 @@ python src/analyze.py
 ```
 
 **输出**（`src/analysis_out/`）：
+
 - `summary_stats.csv` — x1-x8 全局描述统计
 - `correlation_matrix.csv` / `.png` — x1-x8 / y1-y4 相关性热图
 - `x_last_vs_Y.png` — 末态 x vs Y 散点
@@ -75,14 +76,14 @@ python src/train_forecaster.py --epochs 25 --batch-size 32 --y4-boost 3.0
 
 常用参数：
 
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--epochs` | 30 | 训练轮数 |
-| `--batch-size` | 32 | batch 大小 |
-| `--lr` | 2e-3 | Adam 学习率 |
-| `--dim-state` | 128 | 路径积分状态维度 |
-| `--hidden` | 128 | 隐层宽度 |
-| `--device` | auto | cuda / cpu |
+| 参数             | 默认 | 说明             |
+| ---------------- | ---- | ---------------- |
+| `--epochs`     | 30   | 训练轮数         |
+| `--batch-size` | 32   | batch 大小       |
+| `--lr`         | 2e-3 | Adam 学习率      |
+| `--dim-state`  | 128  | 路径积分状态维度 |
+| `--hidden`     | 128  | 隐层宽度         |
+| `--device`     | auto | cuda / cpu       |
 
 > **本版本只预测 x1-x8**——不再预测 y1-y4 / Y。损失 = `MSE(x)`。
 > 把 y 头去掉之后，训练显著更稳定（之前带 y 头 25 epoch 测试集 RMSE(x)=89；现在 2 epoch 已经到 0.45）。
@@ -90,6 +91,7 @@ python src/train_forecaster.py --epochs 25 --batch-size 32 --y4-boost 3.0
 训练支持**任意起点、任意 in_len（16/20/24/32）、任意 out_len（6/8/12/16）** 的样本。
 
 **输出**（`src/model_out/`）：
+
 - `forecaster_best.pt` — 最优 ckpt（含模型权重 + x 标准化器）
 - `scalers.npz` — x 标准化器
 - `test_metrics.json` — 测试集 RMSE（含分维度）
@@ -111,6 +113,7 @@ python src/visualize.py
 ```
 
 **输出**（`src/analysis_out/`）：
+
 - `forecast_x1_x8.png` — 真实 vs 预测的 x1-x8
 - `error_per_dim.png` — 分维度 RMSE 柱状图
 
@@ -121,6 +124,7 @@ python src/per_file_prediction_stats.py
 ```
 
 **输出**（`src/analysis_out/`）：
+
 - `per_file_rmse_boxplot.png` — 按文件夹（dir 1-5）分组的整体 RMSE 箱线图
 - `per_file_rmse_scatter.png` — 每个文件的散点图（按 group 着色，标出 dir 区间）
 - `per_dim_rmse_boxplot.png` — 8 个维度按文件夹分箱的误差分布
@@ -167,6 +171,7 @@ python src/analyze.py \
 ### 控制优化（[optimize.py](optimize.py)，本轮暂停）
 
 暂不启用——等 x 预测稳定后再补回 y 奖励机制。可能的方向：
+
 1. 训练轻量 x→y4 回归器（XGBoost / 随机森林），与过程模型串联；
 2. 复用 N4SID + Kalman 的线性 y 模型（`src_control/`）；
 3. 重新加 y_head，用 y3 当 y4 的 proxy（ρ=0.995）做半监督训练。
@@ -175,11 +180,11 @@ python src/analyze.py \
 
 ## 已知性能瓶颈
 
-| 现象 | 数值 | 原因 | 改进方向 |
-|------|------|------|----------|
-| 自回归长 horizon 累积漂移 | T_out=16 时误差累积 | 自回归预测误差逐级叠加 | 加 teacher forcing；限制 T_out ≤ 12 |
-| 跨 group 泛化 | 未显式建模 | 5 个目录可能为 5 种工况 | 加 group embedding 或分层标准化 |
-| y 预测能力 | 本轮不预测 | y 标签稀疏 → 训练不稳定 | 待 x 稳定后选 y 预测方案 |
+| 现象                      | 数值                | 原因                     | 改进方向                             |
+| ------------------------- | ------------------- | ------------------------ | ------------------------------------ |
+| 自回归长 horizon 累积漂移 | T_out=16 时误差累积 | 自回归预测误差逐级叠加   | 加 teacher forcing；限制 T_out ≤ 12 |
+| 跨 group 泛化             | 未显式建模          | 5 个目录可能为 5 种工况  | 加 group embedding 或分层标准化      |
+| y 预测能力                | 本轮不预测          | y 标签稀疏 → 训练不稳定 | 待 x 稳定后选 y 预测方案             |
 
 ---
 

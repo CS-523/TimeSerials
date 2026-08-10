@@ -4,9 +4,9 @@
 
 不修改 src/train_forecaster.py 与 src/model_lstm.py 任何代码。
 新增 3 个训练模式：
-  --mode pooled     : 现有 LSTMForecaster（5 个 group 一起训，baseline）
-  --mode film       : LSTMForecasterFiLM（共享 LSTM 骨干 + 5 个 FiLM 头）
-  --mode per_group  : LSTMForecaster5Models（5 个独立 LSTM）
+  --mode shared       : 全共享 LSTMForecaster（5 组一起训，baseline）
+  --mode group_head   : LSTMForecasterFiLM（共享骨干 + 组适配头，推荐）
+  --mode independent  : LSTMForecaster5Models（5 个独立 LSTM，精度上界）
 
 数据切分（关键设计）：
   现有 split_experiments 是按"实验 id"随机切 train/val/test。
@@ -98,7 +98,7 @@ class WindowXGDataset(Dataset):
             "x_out": torch.from_numpy(x_out).float(),
             "in_len": s.in_len,
             "out_len": s.out_len,
-            "group_id": int(s.group) - 1,  # 1..5 → 0..4
+            "group_id": int(s.group),  # attach_group 已转为 0..4
         }
 
 
@@ -143,7 +143,7 @@ def train_one_epoch(model, loader, opt, device, mode: str):
         x_out = batch["x_out"].to(device)
         out_lens = batch["out_lens"].to(device)
         T_out = int(out_lens.max().item())
-        if mode == "pooled":
+        if mode == "shared":
             out = model(x_in, T_out=T_out)
         else:
             group_ids = batch["group_ids"].to(device)
@@ -193,7 +193,7 @@ def evaluate(model, loader, device, mode: str,
         out_lens = batch["out_lens"].to(device)
         group_ids = batch["group_ids"]
         T_out = int(out_lens.max().item())
-        if mode == "pooled":
+        if mode == "shared":
             out = model(x_in, T_out=T_out)
         else:
             out = model(x_in, group_ids.to(device), T_out=T_out)
@@ -250,13 +250,13 @@ def evaluate(model, loader, device, mode: str,
 # ===================== 4. 模型构建 =====================
 def build_model(mode: str, dim_x: int, hidden: int, num_layers: int,
                 dropout: float, bidirectional: bool, n_groups: int = 5):
-    if mode == "pooled":
+    if mode == "shared":
         return LSTMForecaster(dim_x=dim_x, hidden=hidden, num_layers=num_layers,
                                 dropout=dropout, bidirectional=bidirectional)
-    if mode == "film":
+    if mode == "group_head":
         return LSTMForecasterFiLM(n_groups=n_groups, dim_x=dim_x, hidden=hidden,
                                     num_layers=num_layers, dropout=dropout, bidirectional=bidirectional)
-    if mode == "per_group":
+    if mode == "independent":
         return LSTMForecaster5Models(n_groups=n_groups, dim_x=dim_x, hidden=hidden,
                                       num_layers=num_layers, dropout=dropout, bidirectional=bidirectional)
     raise ValueError(f"unknown mode: {mode}")
@@ -267,7 +267,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-dir", default="/kefu-nas/ybkong/time_serials-master")
     ap.add_argument("--out-dir", default="/kefu-nas/ybkong/time_serials-master/src/model_out")
-    ap.add_argument("--mode", choices=["pooled", "film", "per_group"], required=True)
+    ap.add_argument("--mode", choices=["shared", "group_head", "independent"], required=True)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=2e-3)
@@ -360,7 +360,7 @@ def main():
 
     # 测试
     ckpt = torch.load(os.path.join(args.out_dir, f"forecaster_{args.mode}_best.pt"),
-                       map_location=device, weights_only=False)
+                       map_location=device)
     model.load_state_dict(ckpt["model"])
     test_metrics = evaluate(model, test_loader, device, args.mode, x_scaler,
                               return_by_group=True)
