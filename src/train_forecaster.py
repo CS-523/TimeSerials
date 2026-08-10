@@ -30,6 +30,7 @@ from data_loader import (
     Scaler,
 )
 from model_forecaster import PathIntegratorForecaster
+from model_lstm import LSTMForecaster
 
 
 def set_seed(seed: int):
@@ -159,6 +160,8 @@ def main():
     ap.add_argument("--hidden", type=int, default=128)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--model", choices=["pathint", "lstm"], default="pathint",
+                    help="选择模型：pathint（PathIntegratorForecaster）或 lstm（LSTMForecaster）")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -191,8 +194,11 @@ def main():
                              collate_fn=pad_collate_x, num_workers=0)
 
     # 模型
-    model = PathIntegratorForecaster(dim_x=8, dim_state=args.dim_state, hidden=args.hidden).to(device)
-    print(f"[train] 模型参数量: {sum(p.numel() for p in model.parameters()):,}")
+    if args.model == "lstm":
+        model = LSTMForecaster(dim_x=8, hidden=args.hidden, num_layers=2, dropout=0.1).to(device)
+    else:
+        model = PathIntegratorForecaster(dim_x=8, dim_state=args.dim_state, hidden=args.hidden).to(device)
+    print(f"[train] 模型: {args.model}，参数量: {sum(p.numel() for p in model.parameters()):,}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
