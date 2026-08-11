@@ -397,7 +397,7 @@ def main():
         ckpt_path = os.path.join(args.out_dir, "forecaster_best.pt")
     else:
         ckpt_path = os.path.join(args.out_dir, f"forecaster_{args.model}_{args.mode}_best.pt")
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     test_metrics = evaluate(model, test_loader, device, mode=args.mode,
                             x_scaler=x_scaler, return_per_dim=True,

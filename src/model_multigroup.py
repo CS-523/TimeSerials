@@ -19,9 +19,9 @@ end-to-end 实证。
 三种模式对比（shared=全共享  group_head=共享骨干+组适配头  independent=逐组独立）：
 
   # Windows PowerShell（单行，在 src/ 目录下执行）
-  python train_multigroup.py --base-dir "D:\Code\timeserials_claude\time-serials-mac" --mode shared --epochs 30
-  python train_multigroup.py --base-dir "D:\Code\timeserials_claude\time-serials-mac" --mode group_head --epochs 30
-  python train_multigroup.py --base-dir "D:\Code\timeserials_claude\time-serials-mac" --mode independent --epochs 30
+  python train_multigroup.py --base-dir "D:/Code/timeserials_claude/time-serials-mac" --mode shared --epochs 30
+  python train_multigroup.py --base-dir "D:/Code/timeserials_claude/time-serials-mac" --mode group_head --epochs 30
+  python train_multigroup.py --base-dir "D:/Code/timeserials_claude/time-serials-mac" --mode independent --epochs 30
 
   # Git Bash（支持 \ 换行）
   EPOCHS=30 DEVICE=cpu bash run_multigroup_compare.sh

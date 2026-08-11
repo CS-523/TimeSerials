@@ -15,7 +15,29 @@
 
 用法：
   cd src
-  python compare_multigroup.py --base-dir "D:\Code\timeserials_claude\time-serials-mac" --epochs 30
+
+  # 训练（推荐：LSTM 和 PathInt 使用各自最优学习率）
+  python compare_multigroup.py \\
+    --base-dir /remote-home/sunxiaoting/ybkong/timserials/time-serials-mac \\
+    --epochs 60 \\
+    --device cuda \\
+    --lr-lstm 2e-3 \\
+    --lr-pathint 5e-4
+
+  # 预测模式（加载已有 checkpoint）
+  python compare_multigroup.py \\
+    --base-dir /remote-home/sunxiaoting/ybkong/timserials/time-serials-mac \\
+    --device cuda --skip-train \\
+    --predict --predict-model "LSTM group_head" \\
+    --predict-cycle-start 0 --predict-input-len 24 --predict-output-len 16
+
+  # 预测模式（迭代长程预测）
+  python compare_multigroup.py \\
+    --base-dir /remote-home/sunxiaoting/ybkong/timserials/time-serials-mac \\
+    --device cuda --skip-train \\
+    --predict --predict-model "PathInt group_head" \\
+    --predict-cycle-start 0 --predict-input-len 24 --predict-output-len 60 \\
+    --predict-chunk-len 16
 """
 from __future__ import annotations
 

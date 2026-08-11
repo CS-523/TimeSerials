@@ -20,7 +20,7 @@ from train_multigroup import (
     evaluate as evaluate_mg,
 )
 
-BASE = "D:/Code/timeserials_claude/time-serials-mac"
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(BASE, "src", "model_out")
 SEED = 42
 DEVICE = torch.device("cpu")
@@ -62,11 +62,11 @@ test_loader = DataLoader(test_ds, batch_size=32, shuffle=False,
 
 # models to evaluate
 models = [
-    ("LSTM shared",      "lstm",    "shared",      "forecaster_lstm_shared.pt"),
-    ("LSTM group_head",  "lstm",    "group_head",  "forecaster_lstm_group_head.pt"),
-    ("LSTM independent", "lstm",    "independent", "forecaster_lstm_independent.pt"),
-    ("PathInt shared",      "pathint", "shared",      "forecaster_pathint_shared.pt"),
-    ("PathInt group_head",  "pathint", "group_head",  "forecaster_pathint_group_head.pt"),
+    ("LSTM shared",      "lstm",    "shared",      "forecaster_lstm.pt"),
+    ("LSTM group_head",  "lstm",    "group_head",  "forecaster_lstm_group_head_best.pt"),
+    ("LSTM independent", "lstm",    "independent", "forecaster_lstm_independent_best.pt"),
+    ("PathInt shared",      "pathint", "shared",      "forecaster_pathint.pt"),
+    ("PathInt group_head",  "pathint", "group_head",  "forecaster_pathint_group_head_best.pt"),
 ]
 
 results = {}
@@ -76,7 +76,7 @@ for display_name, backbone, mode, ckpt_name in models:
         print(f"  [SKIP] {ckpt_path} 不存在")
         continue
     model = build_model(backbone, mode).to(DEVICE)
-    ckpt = torch.load(ckpt_path, map_location=DEVICE)
+    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model"])
     metrics = evaluate_mg(model, test_loader, DEVICE, mode, x_scaler, return_by_group=True)
     n_params = sum(p.numel() for p in model.parameters())

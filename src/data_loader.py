@@ -212,6 +212,8 @@ class Scaler:
         arrs = []
         for e in exps:
             arrs.append(e.df[X_COLS].to_numpy())
+        if not arrs:
+            raise ValueError("Cannot fit Scaler: no experiments provided (train_exps is empty)")
         all_x = np.concatenate(arrs, axis=0)
         return cls(mean=all_x.mean(0).astype(np.float32), std=(all_x.std(0) + 1e-6).astype(np.float32))
 
@@ -233,6 +235,8 @@ class YScaler:
         arrs = []
         for e in exps:
             arrs.append(e.df[Y_INT_COLS].to_numpy())
+        if not arrs:
+            raise ValueError("Cannot fit YScaler: no experiments provided (train_exps is empty)")
         all_y = np.concatenate(arrs, axis=0)
         return cls(means=np.nanmean(all_y, axis=0).astype(np.float32),
                    stds=(np.nanstd(all_y, axis=0) + 1e-6).astype(np.float32))
