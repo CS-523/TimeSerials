@@ -44,6 +44,25 @@ def _plot_corr_heatmap(corr_df: pd.DataFrame, title: str, save_path: str):
     plt.close()
 
 
+def _plot_xy_corr_heatmap(corr_df: pd.DataFrame, title: str, save_path: str):
+    """绘制 x1-x8 vs y1-y4 交叉相关热图（非方阵，8 行 x 4 列）并保存。"""
+    fig, ax = plt.subplots(figsize=(7, 9))
+    im = ax.imshow(corr_df.values, cmap="RdBu_r", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(corr_df.columns)))
+    ax.set_xticklabels(corr_df.columns)
+    ax.set_yticks(range(len(corr_df.index)))
+    ax.set_yticklabels(corr_df.index)
+    ax.set_title(title)
+    for i in range(len(corr_df.index)):
+        for j in range(len(corr_df.columns)):
+            ax.text(j, i, f"{corr_df.values[i, j]:.2f}",
+                    ha="center", va="center", fontsize=10, color="black")
+    plt.colorbar(im)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120)
+    plt.close()
+
+
 def _plot_top10_Y_bar(corr_df: pd.DataFrame, title: str, save_path: str):
     """绘制与 Y 的 Pearson 相关系数 top-10 柱状图。"""
     y_corr = corr_df["Y"].drop("Y").sort_values(key=abs, ascending=True)
@@ -162,6 +181,13 @@ def main(base_dir: str = None,
     corr_df.to_csv(os.path.join(out_dir, "correlation_matrix.csv"))
     _plot_corr_heatmap(corr_df, "Correlation: x1-x8 & y1-y4 (all groups)",
                        os.path.join(out_dir, "correlation_matrix.png"))
+
+    # === 3a. x1-x8 vs y1-y4 交叉相关（8x4 子矩阵）===
+    xy_corr = corr_df.loc[X_COLS, Y_INT_COLS]
+    xy_corr.to_csv(os.path.join(out_dir, "x_y_correlation.csv"))
+    _plot_xy_corr_heatmap(xy_corr, "x1-x8 vs y1-y4 (Pearson, all groups)",
+                          os.path.join(out_dir, "x_y_correlation.png"))
+    print(f"[analyze] x-y 交叉相关热图已写入 x_y_correlation.png")
 
     # === 3b. 按 group 分别绘制相关性矩阵 ===
     for g in sorted(set(e.group for e in exps)):

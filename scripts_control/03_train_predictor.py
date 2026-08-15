@@ -232,6 +232,7 @@ def main() -> None:
             no_improve = 0
             torch.save({"model": model.state_dict(), "yhead": yhead.state_dict()},
                        out_dir / "ss_nn_best.pt")
+            print(f"  saved → {(out_dir / 'ss_nn_best.pt').resolve()}")
         else:
             no_improve += 1
         if epoch % 5 == 0 or epoch == 1:
@@ -245,9 +246,11 @@ def main() -> None:
     # Save last
     torch.save({"model": model.state_dict(), "yhead": yhead.state_dict()},
                out_dir / "ss_nn_last.pt")
+    print(f"  saved → {(out_dir / 'ss_nn_last.pt').resolve()}")
 
     # Save history
     (metrics_dir / "training_log.json").write_text(json.dumps(history, indent=2))
+    print(f"  saved → {(metrics_dir / 'training_log.json').resolve()}")
 
     # ----------------------------------------------------------------------- #
     # Test evaluation
@@ -297,6 +300,7 @@ def main() -> None:
         ])),
     }
     (metrics_dir / "test_metrics.json").write_text(json.dumps(test_metrics, indent=2))
+    print(f"  saved → {(metrics_dir / 'test_metrics.json').resolve()}")
 
     # Save predictions
     np.savez(
@@ -307,6 +311,7 @@ def main() -> None:
         u=test["X"],
         file_ids=test["file_ids"],
     )
+    print(f"  saved → {(pred_dir / 'test_predictions.npz').resolve()}")
     print(f"Test metrics: {json.dumps(per_var, indent=2)}")
     print("Done.")
 

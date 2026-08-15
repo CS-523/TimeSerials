@@ -134,7 +134,7 @@ def _slice_pred(out_pred: torch.Tensor, out_lens: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def train_one_epoch(model, loader, opt, device, mode: str):
+def train_one_epoch(model, loader, opt, device, mode: str, use_tf: bool = False):
     model.train()
     total_loss = 0.0
     n = 0
@@ -144,10 +144,11 @@ def train_one_epoch(model, loader, opt, device, mode: str):
         out_lens = batch["out_lens"].to(device)
         T_out = int(out_lens.max().item())
         if mode == "shared":
-            out = model(x_in, T_out=T_out)
+            out = model(x_in, T_out=T_out, x_out=x_out if use_tf else None)
         else:
             group_ids = batch["group_ids"].to(device)
-            out = model(x_in, group_ids, T_out=T_out)
+            out = model(x_in, group_ids, T_out=T_out,
+                        x_out=x_out if use_tf else None)
         # 计算每个样本的 MSE（变长对齐）
         x_loss = 0.0
         cnt = 0
@@ -171,9 +172,13 @@ def train_one_epoch(model, loader, opt, device, mode: str):
 
 @torch.no_grad()
 def evaluate(model, loader, device, mode: str,
-             x_scaler: Scaler, return_by_group: bool = True):
+             x_scaler: Scaler, return_by_group: bool = True,
+             use_tf: bool = False):
     """
     整体 RMSE + per-group RMSE。
+
+    use_tf=True 时，forward 会收到真实未来值 x_out（teacher forcing），
+    每步用真实值外推一步，得到"一步外推" RMSE，用于与纯自回归（累积漂移）对比。
     """
     model.eval()
     # 全局累计
@@ -194,9 +199,10 @@ def evaluate(model, loader, device, mode: str,
         group_ids = batch["group_ids"]
         T_out = int(out_lens.max().item())
         if mode == "shared":
-            out = model(x_in, T_out=T_out)
+            out = model(x_in, T_out=T_out, x_out=x_out if use_tf else None)
         else:
-            out = model(x_in, group_ids.to(device), T_out=T_out)
+            out = model(x_in, group_ids.to(device), T_out=T_out,
+                        x_out=x_out if use_tf else None)
 
         pred = out["pred_x"]
         for i in range(x_out.size(0)):
@@ -345,22 +351,23 @@ def main():
         tr_loss = train_one_epoch(model, train_loader, opt, device, args.mode)
         sched.step()
         val_metrics = evaluate(model, val_loader, device, args.mode, x_scaler,
-                                 return_by_group=False)
+                                 return_by_group=True)
         elapsed = time.time() - t0
         print(f"Epoch {ep+1:02d}/{args.epochs} | tr_loss={tr_loss:.4f} | "
               f"val_rmse_x(norm)={val_metrics['rmse_x_norm']:.4f} | {elapsed:.1f}s")
+
         if val_metrics["rmse_x_norm"] < best_val:
             best_val = val_metrics["rmse_x_norm"]
             torch.save({
                 "model": model.state_dict(),
                 "x_scaler": {"mean": x_scaler.mean, "std": x_scaler.std},
                 "args": vars(args),
-            }, os.path.join(args.out_dir, f"forecaster_{args.mode}_best.pt"))
+            }, os.path.join(args.out_dir, f"forecaster_lstm_{args.mode}.pt"))
             print(f"  -> saved best (rmse_x_norm={best_val:.4f})")
 
     # 测试
-    ckpt = torch.load(os.path.join(args.out_dir, f"forecaster_{args.mode}_best.pt"),
-                       map_location=device)
+    ckpt = torch.load(os.path.join(args.out_dir, f"forecaster_lstm_{args.mode}.pt"),
+                       map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     test_metrics = evaluate(model, test_loader, device, args.mode, x_scaler,
                               return_by_group=True)

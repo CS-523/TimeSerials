@@ -256,6 +256,26 @@ def init_hybrid_from_n4sid(
     model.init_from_n4sid(n4sid_model)
 
 
+def init_x_recon(model: SS_NN_Hybrid) -> None:
+    """Warm-start an x-reconstruction model (``dim_y == dim_u``).
+
+    Sets the linear feedthrough ``D`` to the identity so the linear baseline
+    passes the input through unchanged (``x̂_lin ≈ u``); the residual MLP then
+    learns only the denoising/imputation correction on top.
+
+    Intended for the independent x1–x8 denoising model
+    (``SS_NN_Hybrid(dim_u=8, dim_y=8)``), not for the y-predictor (whose ``D``
+    comes from N4SID).
+    """
+    if model.dim_u != model.dim_y:
+        raise ValueError(
+            f"init_x_recon expects dim_u == dim_y, got "
+            f"{model.dim_u} vs {model.dim_y}"
+        )
+    with torch.no_grad():
+        model.linear.D.data = torch.eye(model.dim_u, dtype=model.linear.D.dtype)
+
+
 # --------------------------------------------------------------------------- #
 # Smoke test
 # --------------------------------------------------------------------------- #

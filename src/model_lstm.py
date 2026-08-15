@@ -76,23 +76,27 @@ class LSTMForecaster(nn.Module):
             c_last = c_T[-1]
         return h_last, c_last
 
-    def forward(self, past_x: torch.Tensor, T_out: int) -> dict:
+    def forward(self, past_x: torch.Tensor, T_out: int,
+                x_out: torch.Tensor | None = None) -> dict:
+        """
+        past_x: (B, L_in, 8)
+        T_out:  预测步数
+        x_out:  (B, T_out, 8) 真实未来值（标准化空间），用于 teacher forcing；
+                None 时使用纯自回归。
+        """
         h_last, c_last = self.encode(past_x)              # (B, enc_dim), (B, hidden)
-        # 用末态 → 一次性映射到 T_out 步
         B = past_x.size(0)
-        # 取 past x 最后一步作为锚
         x_last = past_x[:, -1, :]                          # (B, 8)
-        # 每一步基于"上一步预测 + 末态"预测下一步
         preds = []
         s = x_last
-        # 简单循环解码，但每次都把 h_last 注入；这样既保持 LSTM-style 解码又用上编码器末态
         h = h_last
         for t in range(T_out):
             inp = torch.cat([s, h], dim=-1)                # (B, 8 + enc_dim)
             dx = self.head(inp)                            # (B, 8) — 预测 Δx
             x_next = s + dx
             preds.append(x_next)
-            s = x_next
+            # teacher forcing: 喂真实值作为下一步输入；否则用自己的预测
+            s = x_out[:, t] if x_out is not None else x_next
         pred_x = torch.stack(preds, dim=1)                # (B, T_out, 8)
         return {"pred_x": pred_x}
 

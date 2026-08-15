@@ -145,7 +145,8 @@ class PathIntegratorForecaster(nn.Module):
         self.eval()
         return self._rollout(past_x, T_out)
 
-    def _rollout(self, past_x: torch.Tensor, T_out: int) -> torch.Tensor:
+    def _rollout(self, past_x: torch.Tensor, T_out: int,
+                 x_out: torch.Tensor | None = None) -> torch.Tensor:
         s = self.encode(past_x)                            # (B, D)
         x_last = past_x[:, -1, :]                          # (B, 8)
         pred_x = []
@@ -154,26 +155,26 @@ class PathIntegratorForecaster(nn.Module):
             dx = self.x_head(inp)
             x_next = x_last + dx                           # 残差式预测
             pred_x.append(x_next)
-            x_last = x_next
-            # s 自更新
-            a = self.x_proj(x_next)
+            # teacher forcing: 用真实值更新 x_last 和状态 s
+            if x_out is not None:
+                x_last = x_out[:, t]
+                a = self.x_proj(x_out[:, t])
+            else:
+                x_last = x_next
+                a = self.x_proj(x_next)
             s = self.gated_cell(s, a)
         pred_x = torch.stack(pred_x, dim=1)                # (B, T, 8)
         return pred_x
 
-    def forward(self, past_x: torch.Tensor, T_out: int) -> dict:
-        s = self.encode(past_x)
-        x_last = past_x[:, -1, :]
-        pred_x = []
-        for t in range(T_out):
-            inp = torch.cat([s, x_last], dim=-1)
-            dx = self.x_head(inp)
-            x_next = x_last + dx
-            pred_x.append(x_next)
-            x_last = x_next
-            a = self.x_proj(x_next)
-            s = self.gated_cell(s, a)
-        pred_x = torch.stack(pred_x, dim=1)
+    def forward(self, past_x: torch.Tensor, T_out: int,
+                x_out: torch.Tensor | None = None) -> dict:
+        """
+        past_x: (B, L_in, 8)
+        T_out:  预测步数
+        x_out:  (B, T_out, 8) 真实未来值（标准化空间），用于 teacher forcing；
+                None 时使用纯自回归。
+        """
+        pred_x = self._rollout(past_x, T_out, x_out=x_out)
         return {"pred_x": pred_x}
 
 

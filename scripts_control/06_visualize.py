@@ -1,5 +1,17 @@
 """End-to-end visualization mirroring the style of ``src/visualize.py``.
 
+Usage::
+
+    python -m scripts_control.06_visualize \
+        --ckpt checkpoints/ss_nn_best.pt \
+        --x-ckpt checkpoints/x_recon_best.pt \
+        --test data/processed/test.npz \
+        --preds results/predictions/test_predictions.npz \
+        --scalers data/processed/scalers.npz \
+        --pareto results/metrics/pareto.json \
+        --out-dir src_control/analysis_out \
+        --n-samples 2
+
 Reads the trained SS-NN model and test-set predictions, then draws:
 
   1. ``forecast_x1_x8.png``     — true vs predicted x1..x8 for 2 samples
@@ -19,8 +31,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 
@@ -38,8 +51,11 @@ from src_control.utils.seed import set_seed
 
 # Palette consistent with src_control/visualization/plots.py
 COL_HISTORY = "black"
-COL_TRUTH = "#2ca02c"   # green
 COL_PRED = "#d62728"    # red
+
+# Per-channel styles for y1..y4 (distinct color + marker per channel).
+Y_COLORS = ("#4C72B0", "#DD8452", "#55A467", "#C44E52")  # blue, orange, green, red
+Y_MARKERS = ("o", "s", "^", "D")
 
 
 # Default output directory: <src_control>/analysis_out/
@@ -56,9 +72,32 @@ _repo_root = os.path.dirname(os.path.dirname(_module_file))
 DEFAULT_OUT_DIR = os.path.join(_repo_root, "src_control", "analysis_out")
 
 
+def _warn_missing(artifact: str, path: str, consequence: str) -> None:
+    """Emit a prominent, non-silent warning for a missing optional artifact.
+
+    Optional artifacts (y model, x model, preds, pareto JSON) are skipped so
+    the script can still draw whatever *is* available, but the skip must never
+    be silent — it goes to stderr with an explicit WARNING banner.
+    """
+    print(
+        f"[viz] WARNING: {artifact} not found: {path}\n"
+        f"[viz]          → {consequence}",
+        file=sys.stderr,
+    )
+
+
 def _load_model_and_data(
-    ckpt_path: str, test_npz: str, scalers_npz: str, device: str
-) -> Tuple[SS_NN_Hybrid, YHead, Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    ckpt_path: str, test_npz: str, scalers_npz: str, device: str, skipped: List[str]
+) -> Tuple[Optional[SS_NN_Hybrid], Optional[YHead], Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    test = load_processed(test_npz)
+    scaler = np.load(scalers_npz)
+
+    if not os.path.exists(ckpt_path):
+        _warn_missing("y model checkpoint", ckpt_path,
+                      "y panels + forecast_y1_y4.png will be skipped")
+        skipped.append(f"y model checkpoint: {ckpt_path}")
+        return None, None, test, scaler
+
     ckpt = torch.load(ckpt_path, map_location=device)
     model = SS_NN_Hybrid(dim_u=8, dim_y=4, n_state=16, hidden=128, window=4)
     model.load_state_dict(ckpt["model"])
@@ -68,9 +107,6 @@ def _load_model_and_data(
     yhead = yhead.to(device)
     model.eval()
     yhead.eval()
-
-    test = load_processed(test_npz)
-    scaler = np.load(scalers_npz)
     return model, yhead, test, scaler
 
 
@@ -102,80 +138,88 @@ def _predict_one(
     return x_raw, y_pred_denorm
 
 
+def _load_x_model(ckpt_path: str, device: str, skipped: List[str]) -> Optional[SS_NN_Hybrid]:
+    """Load the independent x-reconstruction model, or ``None`` if absent.
+
+    ``checkpoints/x_recon_best.pt`` stores a raw ``state_dict`` (from
+    ``scripts_control.08_train_x_model``), unlike the y checkpoint which wraps
+    ``{"model": ..., "yhead": ...}``.
+    """
+    if not os.path.exists(ckpt_path):
+        _warn_missing("x-reconstruction model checkpoint", ckpt_path,
+                      "x̂ overlay (red dashed) will be skipped")
+        skipped.append(f"x model checkpoint: {ckpt_path}")
+        return None
+    x_model = SS_NN_Hybrid(dim_u=8, dim_y=8, n_state=16, hidden=128, window=4)
+    x_model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    x_model = x_model.to(device)
+    x_model.eval()
+    return x_model
+
+
+def _predict_x(
+    x_model: SS_NN_Hybrid,
+    x_raw: np.ndarray,          # (T, 8) raw x values
+    scaler: Dict[str, np.ndarray],
+    device: str,
+) -> np.ndarray:
+    """Run the x-reconstruction model on x and return denormalized x̂ (T, 8)."""
+    x_mean = scaler["x_mean"]
+    x_scale = scaler["x_scale"]
+    x_std = (x_raw - x_mean) / x_scale
+    x_t = torch.tensor(x_std, dtype=torch.float32, device=device).unsqueeze(0)
+    with torch.no_grad():
+        x_pred = x_model(x_t, y_prev=None, teacher_forcing=0.0)
+    x_pred_np = x_pred[0].cpu().numpy()
+    return x_pred_np * x_scale + x_mean
+
+
 # --------------------------------------------------------------------------- #
 # 1) x1..x8 forecast
 # --------------------------------------------------------------------------- #
 def plot_forecast_x(
     test: Dict[str, np.ndarray],
-    model: SS_NN_Hybrid,
     scaler: Dict[str, np.ndarray],
     sample_indices: List[int],
     out_path: str,
     device: str,
+    x_model: Optional[SS_NN_Hybrid] = None,
 ) -> None:
-    """Plot x1..x8 (history + ground truth) for the selected samples to
-    visualise the input trajectory. The model's y prediction is overlaid
-    as a secondary line so the figure also shows the model output.
+    """Plot x1..x8 (history + reconstructed x̂) for the selected samples.
 
-    Layout: 2 rows × 8 cols per sample (top: x1..x8, bottom: y1..y4 prediction).
+    y predictions live in ``plot_forecast_y`` / ``forecast_y1_y4.png``, so this
+    figure is x-only: 8 columns per sample.
     """
     x_mean = scaler["x_mean"]
     x_scale = scaler["x_scale"]
-    y_mean = scaler["y_mean"]
-    y_scale = scaler["y_scale"]
     X_COLS = ("x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8")
-    Y_NAMES = ("y1", "y2", "y3", "y4")
 
     n = len(sample_indices)
-    fig, axes = plt.subplots(n, 12, figsize=(36, 3.2 * n), sharex=True)
+    n_cols = 8
+    fig, axes = plt.subplots(n, n_cols, figsize=(3.0 * n_cols, 3.2 * n), sharex=True)
     if n == 1:
         axes = axes[None, :]
 
     for ei, idx in enumerate(sample_indices):
         X = test["X"][idx]
         T = int(test["lengths"][idx])
-        x_std = X[:T]
-        x_raw = x_std * x_scale + x_mean
-        x_raw = x_raw.astype(np.float32)
+        x_raw = (X[:T] * x_scale + x_mean).astype(np.float32)
 
-        Y = test["Y"][idx]
-        Y_mask = test["Y_mask"][idx]
-        y_raw = Y[:T] * y_scale + y_mean
-        y_raw = y_raw.astype(np.float32)
+        # Optional x-reconstruction overlay (independent x denoising model)
+        x_pred = _predict_x(x_model, x_raw, scaler, device) if x_model is not None else None
 
-        # Run model (teacher-forced) over the full window
-        _, y_pred = _predict_one(model, x_raw, y_raw, Y_mask[:T], scaler, device,
-                                  teacher_forcing=1.0)
-
-        # Top row: x1..x8 history (black) + ground truth (green dots; since
-        # the y_history is sparse, we use the same x history for both halves
-        # of the window and overlay the y_pred line to show the model's
-        # interpretation). The y-axis is the x value (since x is on input).
+        # x1..x8 history (black) + reconstructed x̂ (red dashed).
         for ci, c in enumerate(X_COLS):
             ax = axes[ei, ci]
             ax.plot(np.arange(T), x_raw[:, ci], color=COL_HISTORY, lw=1.2,
                      label="history (input)")
+            if x_pred is not None:
+                ax.plot(np.arange(T), x_pred[:, ci], color=COL_PRED, lw=1.0,
+                        ls="--", alpha=0.85, label="x̂ pred")
             ax.set_title(f"{c} — samp {idx}", fontsize=9)
             ax.grid(True, alpha=0.3)
             ax.tick_params(labelsize=7)
             if ci == 0 and ei == 0:
-                ax.legend(fontsize=6, loc="upper left")
-
-        # Bottom row: y1..y4 predictions (red dashed) vs observed ground truth (green dots)
-        for yi, name in enumerate(Y_NAMES):
-            ax = axes[ei, 8 + yi]
-            mask_col = Y_mask[:T, yi]
-            # Observed ground truth
-            if mask_col.any():
-                t_obs = np.where(mask_col)[0]
-                ax.scatter(t_obs, y_raw[mask_col, yi], s=22, color=COL_TRUTH,
-                            zorder=5, label="observed truth")
-            ax.plot(np.arange(T), y_pred[:, yi], color=COL_PRED, lw=1.0,
-                     ls="--", alpha=0.85, label="model pred")
-            ax.set_title(f"{name} — samp {idx}", fontsize=9)
-            ax.grid(True, alpha=0.3)
-            ax.tick_params(labelsize=7)
-            if yi == 0 and ei == 0:
                 ax.legend(fontsize=6, loc="upper left")
 
     plt.tight_layout()
@@ -195,7 +239,11 @@ def plot_forecast_y(
     out_path: str,
     device: str,
 ) -> None:
-    """Plot y1..y4: history vs predicted (teacher-forced, full window)."""
+    """Plot y1..y4, one subplot per channel (independently auto-scaled).
+
+    Each channel gets its own y-axis so the small y1/y2 channels are not
+    squashed by the much larger y3/y4 range.
+    """
     x_mean = scaler["x_mean"]
     x_scale = scaler["x_scale"]
     y_mean = scaler["y_mean"]
@@ -203,9 +251,9 @@ def plot_forecast_y(
     Y_NAMES = ("y1", "y2", "y3", "y4")
 
     n = len(sample_indices)
-    fig, axes = plt.subplots(n, 1, figsize=(13, 3.5 * n), sharex=False)
+    fig, axes = plt.subplots(n, 4, figsize=(16, 3.2 * n), sharex=True)
     if n == 1:
-        axes = [axes]
+        axes = axes[None, :]
 
     for ei, idx in enumerate(sample_indices):
         X = test["X"][idx]
@@ -221,21 +269,26 @@ def plot_forecast_y(
         _, y_pred = _predict_one(model, x_raw, y_raw, Y_mask[:T], scaler, device,
                                   teacher_forcing=1.0)
 
-        ax = axes[ei]
         t = np.arange(T)
         for yi, name in enumerate(Y_NAMES):
+            ax = axes[ei, yi]
+            color = Y_COLORS[yi]
             mask_col = Y_mask[:T, yi]
             if mask_col.any():
-                ax.plot(t[mask_col], y_raw[mask_col, yi], "o",
-                         color=COL_TRUTH, markersize=4, label=f"{name} truth")
-            ax.plot(t, y_pred[:, yi], color=COL_PRED, lw=1.0, ls="--",
-                     alpha=0.8, label=f"{name} pred")
-        ax.set_title(f"y1..y4 — sample {idx} (file {test['file_ids'][idx]})",
-                      fontsize=10)
-        ax.set_xlabel("timestep")
-        ax.set_ylabel("y value")
-        ax.legend(fontsize=7, ncol=2, loc="upper right")
-        ax.grid(True, alpha=0.3)
+                ax.plot(t[mask_col], y_raw[mask_col, yi],
+                        marker=Y_MARKERS[yi], linestyle="none", color=color,
+                        markersize=5, label="observed truth")
+            ax.plot(t, y_pred[:, yi], color=color, lw=1.0, ls="--",
+                     alpha=0.85, label="model pred")
+            ax.set_title(f"{name} — sample {idx}", fontsize=9)
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(labelsize=7)
+            if yi == 0:
+                ax.set_ylabel("y value", fontsize=8)
+            if ei == n - 1:
+                ax.set_xlabel("timestep", fontsize=8)
+            if yi == 0 and ei == 0:
+                ax.legend(fontsize=7, loc="upper left")
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
@@ -299,10 +352,13 @@ def plot_error_distribution(
 def plot_optimization_compare(
     pareto_json: str,
     out_path: str,
+    skipped: List[str],
 ) -> None:
     """Plot baseline vs optimized y4 (Pareto points highlighted)."""
     if not os.path.exists(pareto_json):
-        print(f"[viz] {pareto_json} not found — skipping optimization plot.")
+        _warn_missing("Pareto JSON", pareto_json,
+                      "optimization_compare.png will be skipped")
+        skipped.append(f"Pareto JSON: {pareto_json}")
         return
     with open(pareto_json) as f:
         data = json.load(f)
@@ -348,16 +404,41 @@ def plot_optimization_compare(
 # --------------------------------------------------------------------------- #
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", default="checkpoints/ss_nn_best.pt")
+    parser.add_argument("--ckpt", default=None,
+                        help="y model checkpoint (default: <out-root>/checkpoints/ss_nn_best.pt, "
+                             "or checkpoints/ss_nn_best.pt when --out-root is unset).")
+    parser.add_argument("--x-ckpt", default=None,
+                        help="Optional x-reconstruction model for the x1..x8 overlay "
+                             "(default: <out-root>/checkpoints/x_recon_best.pt).")
     parser.add_argument("--test", default="data/processed/test.npz")
-    parser.add_argument("--preds", default="results/predictions/test_predictions.npz")
+    parser.add_argument("--preds", default=None,
+                        help="Test predictions npz (default: <out-root>/results/predictions/test_predictions.npz).")
     parser.add_argument("--scalers", default="data/processed/scalers.npz")
-    parser.add_argument("--pareto", default="results/metrics/pareto.json")
+    parser.add_argument("--pareto", default=None,
+                        help="Pareto JSON (default: <out-root>/results/metrics/pareto.json).")
+    parser.add_argument("--out-root", default=None,
+                        help="Root for model/prediction artifacts. When set, --ckpt/--x-ckpt/"
+                             "--preds/--pareto default to <out-root>/checkpoints/... and "
+                             "<out-root>/results/... (e.g. --out-root scripts_control).")
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR,
                          help=f"Output directory (default: {DEFAULT_OUT_DIR})")
     parser.add_argument("--n-samples", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    # Resolve artifact paths: an explicit --ckpt/--x-ckpt/--preds/--pareto wins;
+    # otherwise they default under --out-root (mirrors 08_train_x_model's output).
+    out_root = Path(args.out_root) if args.out_root else None
+
+    def _artifact(rel: str, val: Optional[str]) -> str:
+        if val is not None:
+            return val
+        return str(out_root / rel) if out_root else rel
+
+    ckpt = _artifact("checkpoints/ss_nn_best.pt", args.ckpt)
+    x_ckpt = _artifact("checkpoints/x_recon_best.pt", args.x_ckpt)
+    preds = _artifact("results/predictions/test_predictions.npz", args.preds)
+    pareto = _artifact("results/metrics/pareto.json", args.pareto)
 
     set_seed(args.seed)
     cfg = resolve_paths(get_config())
@@ -368,36 +449,55 @@ def main() -> None:
 
     device = cfg.DEVICE
     print(f"[viz] device: {device}")
+    skipped: List[str] = []
     model, yhead, test, scaler = _load_model_and_data(
-        args.ckpt, args.test, args.scalers, device
+        ckpt, args.test, args.scalers, device, skipped
     )
+    x_model = _load_x_model(x_ckpt, device, skipped)
+
+    if model is None and x_model is None:
+        print("[viz] neither y model nor x model found — nothing to draw. "
+              "Train 08_train_x_model (x) or 03_train_predictor (y) first.")
+        return
 
     lengths = test["lengths"]
     order = np.argsort(lengths)[::-1]
     sample_indices = list(order[: args.n_samples])
 
     plot_forecast_x(
-        test, model, scaler, sample_indices,
+        test, scaler, sample_indices,
         out_path=out_dir / "forecast_x1_x8.png",
         device=device,
+        x_model=x_model,
     )
 
-    plot_forecast_y(
-        test, model, scaler, sample_indices,
-        out_path=out_dir / "forecast_y1_y4.png",
-        device=device,
-    )
+    if model is not None:
+        plot_forecast_y(
+            test, model, scaler, sample_indices,
+            out_path=out_dir / "forecast_y1_y4.png",
+            device=device,
+        )
 
-    if os.path.exists(args.preds):
+    if os.path.exists(preds):
         plot_error_distribution(
-            args.preds, out_path=out_dir / "error_distribution.png",
+            preds, out_path=out_dir / "error_distribution.png",
         )
     else:
-        print(f"[viz] {args.preds} not found — skipping error plot.")
+        _warn_missing("test predictions npz", preds,
+                      "error_distribution.png will be skipped")
+        skipped.append(f"test predictions npz: {preds}")
 
     plot_optimization_compare(
-        args.pareto, out_path=out_dir / "optimization_compare.png",
+        pareto, out_path=out_dir / "optimization_compare.png", skipped=skipped,
     )
+
+    if skipped:
+        print("\n" + "=" * 62, file=sys.stderr)
+        print("[viz] WARNING — the following optional artifacts were missing "
+              "and skipped:", file=sys.stderr)
+        for item in skipped:
+            print(f"  - {item}", file=sys.stderr)
+        print("=" * 62, file=sys.stderr)
 
     print(f"[viz] all figures written to {out_dir}/")
 

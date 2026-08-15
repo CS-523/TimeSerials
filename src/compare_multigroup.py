@@ -52,6 +52,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 import matplotlib
 matplotlib.use("Agg")
@@ -107,7 +108,7 @@ def build_model(backbone: str, mode: str, **kwargs):
 
 
 # ────────────────────────── 训练 / 评估 ──────────────────────────
-def train_one_epoch(model, loader, opt, device, mode: str):
+def train_one_epoch(model, loader, opt, device, mode: str, use_tf: bool = False):
     model.train()
     total_loss = 0.0
     n = 0
@@ -117,10 +118,11 @@ def train_one_epoch(model, loader, opt, device, mode: str):
         out_lens = batch["out_lens"].to(device)
         T_out = int(out_lens.max().item())
         if mode == "shared":
-            out = model(x_in, T_out=T_out)
+            out = model(x_in, T_out=T_out, x_out=x_out if use_tf else None)
         else:
             group_ids = batch["group_ids"].to(device)
-            out = model(x_in, group_ids, T_out=T_out)
+            out = model(x_in, group_ids, T_out=T_out,
+                        x_out=x_out if use_tf else None)
         x_loss = 0.0
         cnt = 0
         for i in range(x_out.size(0)):
@@ -140,27 +142,54 @@ def train_one_epoch(model, loader, opt, device, mode: str):
 
 
 def train_model(model, train_loader, val_loader, device, args,
-                mode: str, ckpt_path: str, x_scaler):
-    """统一的训练循环（支持 shared / group_head / independent）。"""
+                mode: str, ckpt_path: str, x_scaler, lr: float,
+                log_dir: str | None = None):
+    """两阶段训练：Teacher Forcing (破冰) → 纯自回归 (抗压纠偏)。"""
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  参数量: {n_params:,}")
+    print(f"  参数量: {n_params:,}  LR={lr}")
 
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    writer = SummaryWriter(log_dir=log_dir) if log_dir else None
+    if writer:
+        print(f"  TensorBoard: {log_dir}")
+
+    tf_epochs = getattr(args, "tf_epochs", 0)
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
     best_val = float("inf")
     for ep in range(args.epochs):
+        use_tf = (tf_epochs > 0) and (ep < tf_epochs)
+        if ep == 0:
+            print(f"  阶段1: Teacher Forcing  (epoch 1-{tf_epochs})" if use_tf
+                  else "  阶段1: Teacher Forcing (跳过)")
+        if ep == tf_epochs:
+            print(f"  >>> 切换至阶段2: 纯自回归 rollout <<<")
+
         t0 = time.time()
-        tr_loss = train_one_epoch(model, train_loader, opt, device, mode)
+        tr_loss = train_one_epoch(model, train_loader, opt, device, mode, use_tf=use_tf)
         sched.step()
         val_m = evaluate_multigroup(model, val_loader, device, mode, x_scaler,
                                     return_by_group=False)
         elapsed = time.time() - t0
-        print(f"  Epoch {ep+1:02d}/{args.epochs} | tr_loss={tr_loss:.4f} | "
+        tag = "[TF]" if use_tf else "[AR]"
+        print(f"  {tag} Epoch {ep+1:02d}/{args.epochs} | tr_loss={tr_loss:.4f} | "
               f"val_rmse={val_m['rmse_x_norm']:.4f} | {elapsed:.1f}s")
+        if writer is not None:
+            writer.add_scalar("train/loss", tr_loss, ep)
+            writer.add_scalar("val/rmse_norm", val_m["rmse_x_norm"], ep)
+            writer.add_scalar("val/rmse_orig", val_m["rmse_x_orig"], ep)
+            writer.add_scalar("lr", sched.get_last_lr()[0], ep)
         if val_m["rmse_x_norm"] < best_val:
             best_val = val_m["rmse_x_norm"]
-            torch.save({"model": model.state_dict(), "args": vars(args)}, ckpt_path)
+            torch.save({
+                "model": model.state_dict(),
+                "x_scaler": {"mean": x_scaler.mean, "std": x_scaler.std},
+                "args": vars(args),
+            }, ckpt_path)
+
+    if writer:
+        writer.close()
     return n_params
 
 
@@ -192,13 +221,65 @@ def plot_comparison(results: dict, model_order: list, model_labels: dict,
         ax.set_title(f"Group {g_str}", fontsize=12, fontweight="bold")
         ax.set_xticks(x_pos)
         ax.set_xticklabels([model_labels[m] for m in model_order], fontsize=7)
-        ax.set_ylabel("RMSE (原始空间)", fontsize=9)
+        ax.set_ylabel("RMSE (original space)", fontsize=9)
         ax.grid(axis="y", alpha=0.3)
         for bar, val in zip(bars, values):
             if val > 0:
                 ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                         f"{val:.0f}", ha="center", va="bottom", fontsize=6)
 
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=130)
+    plt.close()
+    print(f"图表保存至: {out_path}")
+
+
+def _save_metrics_json(results: dict, out_path: str):
+    """把 results（含 by_group）序列化成 JSON。"""
+    serializable = {}
+    for name, data in results.items():
+        serializable[name] = {
+            "backbone": data["backbone"],
+            "mode": data["mode"],
+            "n_params": data["n_params"],
+            "rmse_x_norm": data["rmse_x_norm"],
+            "rmse_x_orig": data["rmse_x_orig"],
+            "by_group": {},
+        }
+        for g_key, g_val in data["by_group"].items():
+            g_key_str = str(g_key + 1) if isinstance(g_key, int) else g_key
+            serializable[name]["by_group"][g_key_str] = {
+                k: v for k, v in g_val.items()
+                if k in ("n", "rmse_x_norm", "rmse_x_orig")
+            }
+    with open(out_path, "w") as f:
+        json.dump(serializable, f, indent=2)
+    print(f"指标保存至: {out_path}")
+
+
+def plot_tf_vs_ar(results_ar: dict, results_tf: dict, model_order: list,
+                  model_labels: dict, out_path: str):
+    """AR（纯自回归）vs TF（teacher forcing 一步外推）整体 RMSE 柱状对比。"""
+    fig, ax = plt.subplots(figsize=(max(6, 1.8 * len(model_order)), 5))
+    x_pos = np.arange(len(model_order))
+    ar_vals = [results_ar[m]["rmse_x_orig"] if m in results_ar else 0
+               for m in model_order]
+    tf_vals = [results_tf[m]["rmse_x_orig"] if m in results_tf else 0
+               for m in model_order]
+    w = 0.38
+    ax.bar(x_pos - w / 2, ar_vals, w, label="Autoregressive (AR)", color="#42a5f5")
+    ax.bar(x_pos + w / 2, tf_vals, w, label="Teacher Forcing (TF)", color="#66bb6a")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([model_labels.get(m, m) for m in model_order], fontsize=8)
+    ax.set_ylabel("RMSE (original space)")
+    ax.set_title("Overall RMSE: Autoregressive vs Teacher Forcing (test set)")
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend()
+    for bars in ax.containers:
+        for bar in bars:
+            if bar.get_height() > 0:
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                        f"{bar.get_height():.0f}", ha="center", va="bottom", fontsize=7)
     plt.tight_layout()
     plt.savefig(out_path, dpi=130)
     plt.close()
@@ -212,17 +293,29 @@ def main():
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch-size", type=int, default=32)
-    ap.add_argument("--lr", type=float, default=2e-3)
+    ap.add_argument("--lr", type=float, default=None,
+                    help="统一学习率（覆盖 --lr-lstm / --lr-pathint）")
+    ap.add_argument("--lr-lstm", type=float, default=2e-3)
+    ap.add_argument("--lr-pathint", type=float, default=5e-4)
     ap.add_argument("--hidden", type=int, default=128)
     ap.add_argument("--dim-state", type=int, default=128)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--skip-train", action="store_true",
                     help="跳过训练，仅用已有 ckpt 评估和画图")
+    ap.add_argument("--tf-epochs", type=int, default=10,
+                    help="前 N 个 epoch 使用 Teacher Forcing（喂真实值）；之后纯自回归")
+    ap.add_argument("--modes", default="shared,group_head",
+                    help="要运行的组策略，逗号分隔。可选: shared,group_head,independent "
+                         "（默认: shared,group_head，不含 independent）")
+    ap.add_argument("--log-dir", default=None,
+                    help="TensorBoard 日志目录，默认 {out_dir}/tensorboard")
     args = ap.parse_args()
 
     if args.out_dir is None:
         args.out_dir = os.path.join(args.base_dir, "src", "model_out")
+    if args.log_dir is None:
+        args.log_dir = os.path.join(args.out_dir, "tensorboard")
     os.makedirs(args.out_dir, exist_ok=True)
     set_seed(args.seed)
     device = torch.device(args.device)
@@ -265,8 +358,10 @@ def main():
 
     # ──── 2. 训练 / 加载 6 个模型 ────
     results = {}
+    results_train = {}
+    results_tf = {}
 
-    model_configs = [
+    all_model_configs = [
         # (display_name, backbone, mode, ckpt_filename)
         ("LSTM shared",      "lstm",    "shared",      "forecaster_lstm_shared.pt"),
         ("LSTM group_head",  "lstm",    "group_head",  "forecaster_lstm_group_head.pt"),
@@ -275,6 +370,15 @@ def main():
         ("PathInt group_head",  "pathint", "group_head",  "forecaster_pathint_group_head.pt"),
         ("PathInt independent", "pathint", "independent", "forecaster_pathint_independent.pt"),
     ]
+
+    # 按 --modes 参数过滤
+    selected_modes = set(args.modes.split(","))
+    model_configs = [mc for mc in all_model_configs if mc[2] in selected_modes]
+    if not model_configs:
+        print(f"[错误] --modes 过滤后无模型可选（--modes={args.modes}）")
+        sys.exit(1)
+    print(f"模式: {args.modes} → {len(model_configs)} 个模型: "
+          f"{[m[0] for m in model_configs]}")
 
     for display_name, backbone, mode, ckpt_name in model_configs:
         ckpt_path = os.path.join(args.out_dir, ckpt_name)
@@ -286,13 +390,22 @@ def main():
         elif not args.skip_train:
             model = build_model(backbone, mode, hidden=args.hidden,
                                 dim_state=args.dim_state).to(device)
+            model_log_dir = os.path.join(args.log_dir, f"{backbone}_{mode}")
+            # per-backbone LR
+            if args.lr is not None:
+                lr = args.lr
+            elif backbone == "lstm":
+                lr = args.lr_lstm
+            else:
+                lr = args.lr_pathint
             n_params = train_model(model, train_loader, val_loader, device, args,
-                                   mode, ckpt_path, x_scaler)
+                                   mode, ckpt_path, x_scaler, lr,
+                                   log_dir=model_log_dir)
 
         # 加载最佳 ckpt 并评估
         model = build_model(backbone, mode, hidden=args.hidden,
                             dim_state=args.dim_state).to(device)
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         test_metrics = evaluate_multigroup(model, test_loader, device, mode, x_scaler,
                                            return_by_group=True)
@@ -312,27 +425,30 @@ def main():
             if bg.get("rmse_x_orig") is not None:
                 print(f"    group {g+1}: RMSE={bg['rmse_x_orig']:.4f}")
 
-    # ──── 3. 保存 JSON ────
-    out_json = os.path.join(args.out_dir, "compare_metrics.json")
-    serializable = {}
-    for name, data in results.items():
-        serializable[name] = {
-            "backbone": data["backbone"],
-            "mode": data["mode"],
-            "n_params": data["n_params"],
-            "rmse_x_norm": data["rmse_x_norm"],
-            "rmse_x_orig": data["rmse_x_orig"],
-            "by_group": {},
+        # 训练集评测（过拟合检查）与 teacher-forcing 评测（一步外推）
+        train_metrics = evaluate_multigroup(model, train_loader, device, mode, x_scaler,
+                                            return_by_group=True)
+        tf_metrics = evaluate_multigroup(model, test_loader, device, mode, x_scaler,
+                                         return_by_group=True, use_tf=True)
+        results_train[display_name] = {
+            "backbone": backbone, "mode": mode, "n_params": n_params,
+            "rmse_x_norm": train_metrics["rmse_x_norm"],
+            "rmse_x_orig": train_metrics["rmse_x_orig"],
+            "by_group": train_metrics["by_group"],
         }
-        for g_key, g_val in data["by_group"].items():
-            g_key_str = str(g_key + 1) if isinstance(g_key, int) else g_key
-            serializable[name]["by_group"][g_key_str] = {
-                k: v for k, v in g_val.items()
-                if k in ("n", "rmse_x_norm", "rmse_x_orig")
-            }
-    with open(out_json, "w") as f:
-        json.dump(serializable, f, indent=2)
-    print(f"\n指标保存至: {out_json}")
+        results_tf[display_name] = {
+            "backbone": backbone, "mode": mode, "n_params": n_params,
+            "rmse_x_norm": tf_metrics["rmse_x_norm"],
+            "rmse_x_orig": tf_metrics["rmse_x_orig"],
+            "by_group": tf_metrics["by_group"],
+        }
+        print(f"  训练集 RMSE(x) 原始空间 = {train_metrics['rmse_x_orig']:.4f} | "
+              f"TF 一步外推 RMSE(x) = {tf_metrics['rmse_x_orig']:.4f}")
+
+    # ──── 3. 保存 JSON ────
+    _save_metrics_json(results, os.path.join(args.out_dir, "compare_metrics.json"))
+    _save_metrics_json(results_train, os.path.join(args.out_dir, "compare_metrics_train.json"))
+    _save_metrics_json(results_tf, os.path.join(args.out_dir, "compare_metrics_tf.json"))
 
     # ──── 4. 画图 ────
     model_labels = {
@@ -343,27 +459,51 @@ def main():
         "PathInt group_head":  "PathInt\ngroup_head",
         "PathInt independent": "PathInt\nindependent",
     }
+    MODE_COLORS = {"shared": "#78909c", "group_head": "#42a5f5", "independent": "#ef5350"}
 
-    # 分 backbone 画两张
-    lstm_order = ["LSTM shared", "LSTM group_head", "LSTM independent"]
-    lstm_colors = ["#78909c", "#42a5f5", "#ef5350"]  # grey, blue, red
-    plot_comparison(results, lstm_order, model_labels, lstm_colors,
-                    "LSTM Backbone — Per-Group RMSE (original space)",
-                    os.path.join(args.out_dir, "compare_bars_lstm.png"))
+    # 分 backbone 画
+    lstm_order = [n for n, d in results.items() if d["backbone"] == "lstm"]
+    pi_order = [n for n, d in results.items() if d["backbone"] == "pathint"]
+    if lstm_order:
+        plot_comparison(results, lstm_order, model_labels,
+                        [MODE_COLORS.get(results[n]["mode"], "#999") for n in lstm_order],
+                        "LSTM Backbone — Per-Group RMSE (original space)",
+                        os.path.join(args.out_dir, "compare_bars_lstm.png"))
+    if pi_order:
+        plot_comparison(results, pi_order, model_labels,
+                        ["#78909c" if results[n]["mode"] == "shared" else "#66bb6a" for n in pi_order],
+                        "PathInt Backbone — Per-Group RMSE (original space)",
+                        os.path.join(args.out_dir, "compare_bars_pathint.png"))
 
-    pi_order = ["PathInt shared", "PathInt group_head", "PathInt independent"]
-    pi_colors = ["#78909c", "#66bb6a", "#ef5350"]  # grey, green, red
-    plot_comparison(results, pi_order, model_labels, pi_colors,
-                    "PathInt Backbone — Per-Group RMSE (original space)",
-                    os.path.join(args.out_dir, "compare_bars_pathint.png"))
+    # 合并图：所有选中模型
+    all_order = list(results.keys())
+    all_colors = [
+        {"LSTM shared": "#78909c", "LSTM group_head": "#42a5f5", "LSTM independent": "#ef5350",
+         "PathInt shared": "#78909c", "PathInt group_head": "#66bb6a", "PathInt independent": "#ff9800"}.get(n, "#999")
+        for n in all_order
+    ]
+    if len(all_order) > 1:
+        plot_comparison(results, all_order, model_labels, all_colors,
+                        "All Models — Per-Group RMSE (original space)",
+                        os.path.join(args.out_dir, "compare_bars_all.png"))
 
-    # 合并图：只画 group_head 和 independent，LSTM vs PathInt
-    best_order = ["LSTM group_head", "PathInt group_head",
-                  "LSTM independent", "PathInt independent"]
-    best_colors = ["#42a5f5", "#66bb6a", "#ef5350", "#ff9800"]
-    plot_comparison(results, best_order, model_labels, best_colors,
-                    "Head-to-Head: group_head vs independent (LSTM vs PathInt)",
-                    os.path.join(args.out_dir, "compare_bars_all.png"))
+    # 训练集合并图（过拟合检查）
+    train_order = list(results_train.keys())
+    if len(train_order) > 1:
+        train_colors = [
+            {"LSTM shared": "#78909c", "LSTM group_head": "#42a5f5", "LSTM independent": "#ef5350",
+             "PathInt shared": "#78909c", "PathInt group_head": "#66bb6a", "PathInt independent": "#ff9800"}.get(n, "#999")
+            for n in train_order
+        ]
+        plot_comparison(results_train, train_order, model_labels, train_colors,
+                        "All Models — Per-Group RMSE, TRAIN (original space)",
+                        os.path.join(args.out_dir, "compare_bars_all_train.png"))
+
+    # TF vs AR 整体 RMSE 对比
+    tf_order = [n for n in all_order if n in results_tf]
+    if tf_order:
+        plot_tf_vs_ar(results, results_tf, tf_order, model_labels,
+                      os.path.join(args.out_dir, "compare_bars_tf_vs_ar.png"))
 
     # ──── 5. 汇总表格 ────
     print(f"\n{'=' * 85}")
@@ -394,6 +534,17 @@ def main():
     print(f"{'=' * 85}")
 
     # ──── 6. 对比分析 ────
+    print("\n=== 自回归 AR vs Teacher Forcing TF（整体 RMSE，原始空间）===")
+    print(f"{'Model':<22} {'AR':>10} {'TF':>10} {'漂移(AR-TF)':>12} {'漂移占比':>10}")
+    for m_name in all_order:
+        ar = results.get(m_name, {}).get("rmse_x_orig")
+        tf = results_tf.get(m_name, {}).get("rmse_x_orig")
+        if ar is None or tf is None:
+            continue
+        drift = ar - tf
+        ratio = drift / ar * 100 if ar > 0 else 0.0
+        print(f"{m_name:<22} {ar:>10.1f} {tf:>10.1f} {drift:>12.1f} {ratio:>9.1f}%")
+
     print("\n=== group_head vs shared 提升幅度 ===")
     for backbone in ["LSTM", "PathInt"]:
         gh_name = f"{backbone} group_head"
@@ -420,7 +571,7 @@ def main():
                   f"差异 {diff:+.1f}%")
 
     print("\n=== LSTM vs PathInt 同模式对比 ===")
-    for mode in ["shared", "group_head", "independent"]:
+    for mode in sorted(selected_modes):
         lstm_name = f"LSTM {mode}"
         pi_name = f"PathInt {mode}"
         if lstm_name in results and pi_name in results:

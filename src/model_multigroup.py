@@ -26,7 +26,7 @@ end-to-end 实证。
   # Git Bash（支持 \ 换行）
   EPOCHS=30 DEVICE=cpu bash run_multigroup_compare.sh
 
-产物：src/model_out/ 下生成 forecaster_{mode}_best.pt 和 test_metrics_{mode}.json
+产物：src/model_out/ 下生成 forecaster_lstm_{mode}.pt 和 test_metrics_{mode}.json
 对比 L5 结论：看 test_metrics_*.json 中 by_group 字段，group_head 是否接近 independent（上界）。
 """
 from __future__ import annotations
@@ -73,35 +73,37 @@ class LSTMForecasterFiLM(nn.Module):
         nn.init.zeros_(self.beta.weight)
 
     def decode_with_head(self, h_last: torch.Tensor, x_last: torch.Tensor,
-                         gamma: torch.Tensor, beta: torch.Tensor, T_out: int) -> torch.Tensor:
+                         gamma: torch.Tensor, beta: torch.Tensor, T_out: int,
+                         x_out: torch.Tensor | None = None) -> torch.Tensor:
         """沿用 LSTMForecaster 的循环解码风格，但在每步融合 (γ, β)。"""
         preds = []
         s = x_last
         h = h_last
         head = self.backbone.head  # 共享 head 矩阵
-        # head 输入 = [γ * s + β, h_last]  → 注意：我们要让每组都有自己的偏移/缩放
-        # 但 head 本身是共享的：把 γ,β 应用到 s 上
-        for _ in range(T_out):
+        for t in range(T_out):
             s_affined = gamma * s + beta
             inp = torch.cat([s_affined, h], dim=-1)
             dx = head(inp)              # (B, 8) Δx
             x_next = s + dx
             preds.append(x_next)
-            s = x_next
+            # teacher forcing: 喂真实值作为下一步输入
+            s = x_out[:, t] if x_out is not None else x_next
         return torch.stack(preds, dim=1)
 
     def forward(self, past_x: torch.Tensor, group_id: torch.Tensor,
-                T_out: int) -> dict:
+                T_out: int, x_out: torch.Tensor | None = None) -> dict:
         """
         past_x:   (B, L, 8)  标准化后
         group_id: (B,)         整数 [0, n_groups-1]
         T_out:    int
+        x_out:    (B, T_out, 8) 真实未来值，用于 teacher forcing；None = 纯自回归
         """
         h_last, _ = self.backbone.encode(past_x)            # (B, enc_dim)
         x_last = past_x[:, -1, :]                            # (B, 8)
         gamma = self.gamma(group_id)                          # (B, 8)
         beta = self.beta(group_id)                            # (B, 8)
-        pred_x = self.decode_with_head(h_last, x_last, gamma, beta, T_out)
+        pred_x = self.decode_with_head(h_last, x_last, gamma, beta, T_out,
+                                        x_out=x_out)
         return {"pred_x": pred_x}
 
 
@@ -126,11 +128,12 @@ class LSTMForecaster5Models(nn.Module):
         ])
 
     def forward(self, past_x: torch.Tensor, group_id: torch.Tensor,
-                T_out: int) -> dict:
+                T_out: int, x_out: torch.Tensor | None = None) -> dict:
         """
         past_x:   (B, L, 8)
         group_id: (B,)
         T_out:    int
+        x_out:    (B, T_out, 8) 真实未来值，用于 teacher forcing；None = 纯自回归
 
         返回时把 B 个样本按 group 排序，再选各自 model 推理，再按原顺序拼回。
         """
@@ -141,12 +144,14 @@ class LSTMForecaster5Models(nn.Module):
         sorted_x = past_x[order]
         sorted_g = group_id[order]
 
-        # 2) 逐 group 调用对应模型
+        # 2) 逐 group 调用对应模型（x_out 也需同步排序）
+        sorted_x_out = x_out[order] if x_out is not None else None
         out_chunks = []
         for g in sorted_g.unique():
             mask = (sorted_g == g)
             xs = sorted_x[mask]
-            out = self.models[int(g.item())](xs, T_out=T_out)["pred_x"]
+            xs_out = sorted_x_out[mask] if sorted_x_out is not None else None
+            out = self.models[int(g.item())](xs, T_out=T_out, x_out=xs_out)["pred_x"]
             out_chunks.append(out)
 
         # 3) 拼接
@@ -180,11 +185,12 @@ class PathIntegratorForecasterFiLM(nn.Module):
         nn.init.zeros_(self.beta.weight)
 
     def forward(self, past_x: torch.Tensor, group_id: torch.Tensor,
-                T_out: int) -> dict:
+                T_out: int, x_out: torch.Tensor | None = None) -> dict:
         """
         past_x:   (B, L, 8)  标准化后
         group_id: (B,)         整数 [0, n_groups-1]
         T_out:    int
+        x_out:    (B, T_out, 8) 真实未来值，用于 teacher forcing；None = 纯自回归
         """
         s = self.backbone.encode(past_x)                   # (B, dim_state)
         x_last = past_x[:, -1, :]                           # (B, 8)
@@ -192,16 +198,20 @@ class PathIntegratorForecasterFiLM(nn.Module):
         beta = self.beta(group_id)                           # (B, 8)
 
         pred_x = []
-        for _ in range(T_out):
+        for t in range(T_out):
             # FiLM 仿射作用于 x_last，再与 PathInt 状态 s 拼接
             x_affined = gamma * x_last + beta
             inp = torch.cat([s, x_affined], dim=-1)
             dx = self.backbone.x_head(inp)
             x_next = x_last + dx
             pred_x.append(x_next)
-            x_last = x_next
-            # PathInt 状态自我演化（不经过 FiLM）
-            a = self.backbone.x_proj(x_next)
+            # teacher forcing: 用真实值更新 x_last 和状态 s
+            if x_out is not None:
+                x_last = x_out[:, t]
+                a = self.backbone.x_proj(x_out[:, t])
+            else:
+                x_last = x_next
+                a = self.backbone.x_proj(x_next)
             s = self.backbone.gated_cell(s, a)
         pred_x = torch.stack(pred_x, dim=1)                # (B, T_out, 8)
         return {"pred_x": pred_x}
@@ -226,11 +236,12 @@ class PathIntegratorForecaster5Models(nn.Module):
         ])
 
     def forward(self, past_x: torch.Tensor, group_id: torch.Tensor,
-                T_out: int) -> dict:
+                T_out: int, x_out: torch.Tensor | None = None) -> dict:
         """
         past_x:   (B, L, 8)
         group_id: (B,)
         T_out:    int
+        x_out:    (B, T_out, 8) 真实未来值，用于 teacher forcing；None = 纯自回归
         """
         B = past_x.size(0)
         # 按 group 排序，记录原位置
@@ -239,12 +250,14 @@ class PathIntegratorForecaster5Models(nn.Module):
         sorted_x = past_x[order]
         sorted_g = group_id[order]
 
-        # 逐 group 调用对应模型
+        # 逐 group 调用对应模型（x_out 也需同步排序）
+        sorted_x_out = x_out[order] if x_out is not None else None
         out_chunks = []
         for g in sorted_g.unique():
             mask = (sorted_g == g)
             xs = sorted_x[mask]
-            out = self.models[int(g.item())](xs, T_out=T_out)["pred_x"]
+            xs_out = sorted_x_out[mask] if sorted_x_out is not None else None
+            out = self.models[int(g.item())](xs, T_out=T_out, x_out=xs_out)["pred_x"]
             out_chunks.append(out)
 
         # 拼接并还原原顺序
