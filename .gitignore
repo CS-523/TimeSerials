@@ -45,6 +45,7 @@ events.out.tfevents.*
 # ===== IDE =====
 .vscode/
 .idea/
+.trae/
 *.swp
 *.swo
 *~
@@ -107,6 +108,7 @@ data/processed/
 results/figures/
 results/metrics/
 results/predictions/
+results/optimization/
 
 # ===== Office 临时文件 =====
 ~$*

@@ -8,6 +8,7 @@
 |---|---|---|
 | `03_train_predictor.py` | 训练 y1–y4 预测模型（线性 SS + NN 残差） | `checkpoints/ss_nn_best.pt` 等 |
 | `08_train_x_model.py` | 训练独立的 x1–x8 多步外推预测模型 | `checkpoints/x_forecast_best.pt` 等 |
+| `04_optimize.py` | 优化未来 x3/x4/x6/x8 使 y4 最大 | `results/optimization/*.png` + `*.json` |
 | `06_visualize.py` | 综合可视化（y 预测 / x̂ 外推，两者都可选） | `src_control/analysis_out/*.png` |
 | `07_ppt_figures.py` | 生成 8 张中文标注的 PPT 图 | `src_control/analysis_out/ppt/*.png` |
 | `05_smoke_test.py` | 端到端冒烟测试（临时目录，几分钟） | 无（临时目录自动清理） |
@@ -73,7 +74,31 @@ python -m scripts_control.08_train_x_model \
 
 训练完成后即可加载做推理，详见下方「加载 x 模型做未来外推」。
 
-## 3. 综合可视化
+## 3. 优化未来 x3/x4/x6/x8 使 y4 最大（04_optimize.py）
+
+**前置**：y 模型（03）与 x 模型（08）都已训好，且 `scalers.npz` 存在。优化冻结这两个模型，只对可控量 x3/x4/x6/x8 做梯度上升，使未来 H 步 y4 均值最大；非可控量 x1/x2/x5/x7 固定为 x 模型的预测轨迹。
+
+```bash
+# 单样本（1 个样本、画 1 张图）
+python -m scripts_control.04_optimize --n-samples 1 --plot-max 1
+
+# 批量评估整个 test 集（看 y4 提升分布）
+python -m scripts_control.04_optimize --all-test
+
+# 加控制 effort 正则（惩罚控制量偏离默认轨迹，抑制外推）
+python -m scripts_control.04_optimize --n-samples 3 --effort-penalty 0.1
+```
+
+- 主要参数：`--context 32` / `--horizon 16`（需与 08 训练一致）、`--n-starts 5`（多起点）、`--max-iter 200`、`--lr 0.05`、`--effort-penalty 0.0`（λ）。
+- 产物：`results/optimization/optimized_vs_baseline_{i}.png`（默认 vs 优化后的 x3/x4/x6/x8 + y4）、`results/optimization/optimize_metrics.json`（每样本 baseline/optimized y4、提升幅度、是否越界）。
+
+**结论**（test 集抽查 3 样本，H=16）：
+
+- 目标稳定上升：y4 提升 +30~32%，无一退化（初值=默认轨迹，no-regression 保证）。
+- **但 λ=0 的收益主要来自外推**：优化器把 x3/x6/x8 推到下边界（x6→5000、x3→11、x8→44），y4 从 ~8000 冲到 ~10400，已超出观测 y4 上限 8536——这是代理模型在训练分布外的乐观外推，不是物理上真能涨 30%。
+- 用 `--effort-penalty` 可拉回：λ≈0.1 → +15%、λ≈1.0 → +1%（贴近默认轨迹、不越界、不外推）。**实际运行建议 λ≈0.1–1.0，或收紧 x6 下界**。
+
+## 4. 综合可视化
 
 画预测叠加图、误差分布。**y 模型和 x 模型都是可选的**——哪个 checkpoint 存在就画哪个：
 
@@ -94,7 +119,7 @@ python -m scripts_control.06_visualize \
   - `forecast_x1_x8.png` — x1..x8 历史 + 未来外推预测（红色虚线，浅灰点线为真实未来）；仅画 x，y 预测在下面独立图里
   - `forecast_y1_y4.png`（仅 y 模型存在时）、`error_distribution.png`
 
-## 4. PPT 图
+## 5. PPT 图
 
 生成 8 张中文标注的 PPT 图（`--figs` 可指定图号子集，如 `1,2,5`）：
 
@@ -106,7 +131,7 @@ python -m scripts_control.07_ppt_figures \
 
 产物：`src_control/analysis_out/ppt/*.png`
 
-## 5. 端到端冒烟测试
+## 6. 端到端冒烟测试
 
 在临时目录跑完整流水线（预处理 + 特征分析 + 训练），验证不报错：
 
@@ -121,6 +146,7 @@ python -m scripts_control.05_smoke_test
 ```
 preprocess ──► 03 训练 y 模型 ──► 06 可视化
 preprocess ──► 08 训练 x 模型 ──► 06 可视化（只画 x 也行）
+preprocess ──► 03 + 08 ──► 04 优化（x3/x4/x6/x8 使 y4 最大）
 ```
 
 两条路径相互独立：只预测 x 就只跑 08（完全不需要 03）。

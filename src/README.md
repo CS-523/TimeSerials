@@ -109,16 +109,52 @@ python src/train_y_poly.py --degree 2 --mode window --window 4
 python src/train_y_poly.py --degree 2 --per-group
 ```
 
-三种模式区别：
+三种模式区别（**特征定义见下节**）：
 
-| 模式 | 特征 | 训练方式 |
+| 模式 | 特征构成 | 训练方式 |
 | --- | --- | --- |
-| `--mode last` | y1~y4 最后一个有效值 → 4 特征 | 全局单模型（train+val 训练 / test 评估） |
-| `--mode window` | y1~y4 最后 N 个观测 → N×4 特征 | 全局单模型 |
-| `--per-group` | 每个 y/x 列的 last/mean/delta，按组挑 top-8 | 每组一个独立模型（组内 80/20） |
+| `--mode last` | y1~y4 各自的**最后一个有效观测值** → 4 特征 | **1 个全局模型**（train+val 训练 / test 评估） |
+| `--mode window` | y1~y4 最后 N 个**有观测的行**，按行展平 → N×4 特征 | **1 个全局模型** |
+| `--per-group` | 每组 36 候选特征里挑 top-8（Pearson \|r\|） | **5 个独立模型**（每组一个，每组内 80/20 划分） |
+
+> ⚠️ **`--per-group` 不是"一个全局模型 + 分组评估"，而是「为每组各训练一个独立的 Ridge 模型」**。最终指标按组汇总（pooled RMSE/MAE/R²）。5 个组 → 5 个 `pipe` → 5 套独立的 `StandardScaler/PolynomialFeatures/Ridge` 参数。
 
 常用参数：`--degree {2,3}`（多项式阶数）、`--alpha`（默认 RidgeCV 自动选）、
 `--drop-y4`（去掉与 y3 共线的 y4）、`--seed`、`--base-dir`、`--out-dir`。
+
+#### 特征精确定义
+
+**前置说明**：y1~y4 在数据中**稀疏**——并不是每行都有观测，可能连续几行都是 NaN，偶发一行 4 个 y 都有值。"有效" = 该行对应 y 列为非 NaN。
+
+1. **`_last_valid(series)`**（`train_y_poly.py:66-69`）：
+   ```python
+   def _last_valid(series):
+       s = series.dropna()           # 先丢掉 NaN
+       return float(s.iloc[-1]) if len(s) > 0 else np.nan
+   ```
+   → **"最后一个有效值" = 该列 y 时间序列里最后一个非 NaN 的值**（不是时间上的"末尾行"，而是观测上的"末尾有效观测"）。例：y1 列在 [0, 2, 5, 8, 9, 10, ..., 47, 49] 行有观测，则 y1 的"最后一个有效值"是第 49 行的值。
+   - 每个 y1~y4 各自取自己的"最后一个有效值"，可能来自**不同的时间步**。
+   - 全列 NaN 时返回 NaN，该实验被丢弃。
+
+2. **`--mode last` 的特征**：`(y1_last, y2_last, y3_last, y4_last)`，4 维。
+
+3. **`--mode window --window N` 的特征**（`extract_features_window`，`train_y_poly.py:124-147`）：
+   - 第 1 步：从每个实验的 y1~y4 时序里挑出**至少有一个 y 被观测到的行**（`dropna(how="all", subset=y_cols)`）。
+   - 第 2 步：取这些行的**最后 N 行**（`obs_rows.tail(N)`）。这是 N 个**观测时刻**，不是时间上等距的 N 步。
+   - 第 3 步：每行内 NaN → 先 `ffill`（沿列方向取最近一次观测）；仍 NaN 的填 0。`tail` 现在是 N×4 矩阵。
+   - 第 4 步：若该实验的观测行数 < N，前端补 0 行（`pad`）至 N 行。
+   - 第 5 步：N×4 矩阵 `flatten()` → 长度 4N 的一维特征向量。
+   - 顺序：从最早到最近（补的 0 行在最前，最后 N 行观测按时间顺序排），然后按 `y1,y2,y3,y4` 列内展平。
+   - **默认 `--window 4` → 16 维**；`--window 8` → 32 维。
+
+4. **`--per-group` 的特征**（`extract_engineered_features`，`train_y_poly.py:78-104`）：
+   - 对 **12 列**（y1~y4 + x1~x8）各算 3 个衍生量 = 36 个候选：
+     - `__last`：`_last_valid(series)`，见上。
+     - `__mean`：全列均值（NaN 忽略）。
+     - `__delta`：`_last_valid − _first_valid`（首末有效值之差，反映累计变化量）。
+   - 丢掉 NaN 占比 >10% 的列（实际几乎不丢）。
+   - 对**每个组**用组内 Pearson \|r\| 与 Y 的相关性排序，**取前 8 个**作为该组的特征（`GROUP_FEATURES` 字典硬编码，见下表）。
+   - **每组用自己的 8 维特征 + 自己的 Ridge 模型**。
 
 #### 各模式一键对比（`run_y_poly_compare.sh`）
 
@@ -142,11 +178,75 @@ bash run_y_poly_compare.sh   # 在仓库根目录执行
 
 **结论**：
 
-- `per-group`(deg2) RMSE 最低（67.1）——「每组专属特征 + 独立模型」有效；
-- `window n=8 + deg3` 的 R² 最高（0.491），是全局模型里最均衡的选择；
+- `per-group`(deg2) RMSE 最低（67.1）——「每组专属特征 + 5 个独立模型」有效；
+- `window n=8 + deg3` 的 R² 最高(0.491)，是**全局模型**里最均衡的选择——长窗口 + 三次项捕捉到更复杂的"y 末态 → Y 终值"关系；
 - `--drop-y4` 反而更差（R² 0.257→0.157）——y4 信息有价值，不建议去掉；
-- window deg2 比 last 更差：特征维度升高但 RidgeCV 选的 α 过大导致欠拟合，升到 deg3 才发挥窗口优势；
-- `per-group deg3` 严重过拟合（G2 RMSE 达 524）——分组样本少 + 56 个多项式特征，分组模式不建议用三次项。
+- window deg2 比 last 更差：特征维度从 4 涨到 16/32，但 RidgeCV 自动选的 α 过大（100~1000）导致欠拟合；只有升到 deg3 才真正发挥窗口优势；
+- `per-group deg3` 严重过拟合（G2 RMSE 达 524）——分组样本少（约 20~34 个/组）却塞进 165 个多项式特征，**每组都不建议用三次项**。
+
+#### 模型结构（`train_y_poly.py`）
+
+**注意：本模型是经典统计学习回归（不是深度神经网络）**——`sklearn.Pipeline` 三段式：
+
+```
+┌──────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+│ StandardScaler   │ →  │ PolynomialFeatures   │ →  │ Ridge / RidgeCV      │
+│ (x − μ) / σ      │    │ (degree 2/3,  含 bias)│    │ 线性 + L2 正则       │
+└──────────────────┘    └──────────────────────┘    └──────────────────────┘
+        ↑                          ↑                          ↑
+   4 / 16 / 32 / 8 维        多项式展开                    输出 1 维 Y
+```
+
+**3 段详解**：
+
+| 阶段 | 类 | 作用 | 输出维度（4 特征示例） |
+| --- | --- | --- | --- |
+| 1. 标准化 | `StandardScaler` | `x_std = (x − μ) / σ`；`μ/σ` 仅在 train+val 上 fit | 4 维 |
+| 2. 多项式展开 | `PolynomialFeatures(degree=d, include_bias=True)` | 生成 `1, x, x², x₁x₂, x³, x₁²x₂ …`；**含 1 阶偏置** | d=2 → 15 维；d=3 → 35 维 |
+| 3. 岭回归 | `Ridge(alpha)` 或 `RidgeCV(alphas=[0.01, 0.1, 1, 10, 50, 100, 500, 1000])` | 线性回归 + L2 正则；RidgeCV 自动按 LOO-MSE 选 α | 1 维（Y） |
+
+**输入维度按模式变化**：
+
+| 模式 | 原始特征数 | deg=2 展开后 | deg=3 展开后 |
+| --- | --- | --- | --- |
+| `--mode last`（y1~y4 末值） | 4 | 15 | 35 |
+| `--mode window --window 4` | 16 | 153 | 969 |
+| `--mode window --window 8` | 32 | 561 | 6545 |
+| `--per-group`（每组 top-8） | 8 | 45 | 165 |
+
+**Per-group = 5 个独立模型**（重点）：
+
+```
+all 171 exps
+   │
+   ├─ group 1 (~30 exps) ──[80/20 split]──▶ pipe_g1  (自己的 StandardScaler + Poly(8→45) + Ridge(45→1))
+   ├─ group 2 (~34 exps) ──[80/20 split]──▶ pipe_g2  (独立的一套参数)
+   ├─ group 3 (~28 exps) ──[80/20 split]──▶ pipe_g3
+   ├─ group 4 (~40 exps) ──[80/20 split]──▶ pipe_g4
+   └─ group 5 (~39 exps) ──[80/20 split]──▶ pipe_g5
+   │
+   └─▶ 把 5 组的 test 预测 concat ──▶ 整体 pooled RMSE/MAE/R²
+```
+
+每个 `pipe_g` 有自己的 `mean/std/poly_features/ridge.coef_`；`joblib.dump` 出来是 `{"pipes": {1:pipe, 2:pipe, 3:pipe, 4:pipe, 5:pipe}, "group_features": GROUP_FEATURES}`。预测新数据时需知道它属于哪个组，再调对应 `pipe`。
+
+**Per-group 特征表**（`GROUP_FEATURES` 字典，代码 `train_y_poly.py:57-63`）：
+
+| 组 | 选取特征（每组 8 个，此处列前 5） | top 特征含义 |
+| --- | --- | --- |
+| 1 | y4__last, y3__mean, x2__mean, y3__last, x7__mean | **y 末值主导**（y3/y4 相关性最强） |
+| 2 | y4__last, y3__last, x2__mean, y3__mean, y4__mean | **y 末值主导**（同 G1，但 y4__mean 进了 top） |
+| 3 | x8__delta, x8__last, x6__last, x6__delta, x4__delta | **x 衍生主导**（无 y 入 top；x8 累计变化最重要） |
+| 4 | y1__last, x2__delta, x2__last, x6__delta, x5__mean | **y1 + x2 主导**（与 G1/G2/G5 不同，y4 没进 top） |
+| 5 | y4__last, x2__mean, y1__mean, x6__mean, y2__mean | y4 + x2/x6 均值（多元） |
+
+每组从 `last/mean/delta` 三个衍生（每列 3 个）共 36 个候选里按组内 Pearson |r| 排序选前 8 个；**不同组可能选完全不同的特征子集**——这正是 per-group 模式的核心价值。
+
+**模型参数量**（线性模型，参数即多项式系数 + 截距）：
+
+- `--mode last, deg=2`：15 系数 + 1 截距 = 16 个；
+- `--per-group, deg=2`：每组 45+1 = 46 个（5 组共 230 个）；
+- `--mode window 8, deg=3`：**6546 个**（参数最多，对应表中 R²=0.491 也是窗口模式的最优解）。
 
 ### 4. 控制优化（**本轮暂停**）
 
