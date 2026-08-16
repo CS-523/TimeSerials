@@ -92,10 +92,10 @@ for degree, mode, rmse, mae, r2, _ in rows:
 
 # 每组 R² 细分
 per_groups = {}
-for _, mode, _, _, _, m in rows:
+for degree, mode, _, _, _, m in rows:
     pg = m.get("per_group")
     if pg:
-        per_groups[mode] = pg
+        per_groups[f"deg{degree} {mode}"] = pg
 
 if per_groups:
     groups = sorted({k for pg in per_groups.values() for k in pg},
