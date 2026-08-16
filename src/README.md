@@ -16,6 +16,7 @@ src/
 ├── analyze.py                      # ★ 关联性分析 + 描述性统计 + 相关性热图
 ├── model_forecaster.py             # ★ 过程预测模型：路径积分编码器 + 自回归 rollout 头
 ├── train_forecaster.py             # ★ 训练循环（支持变 in_len/out_len/起点）
+├── train_y_poly.py                 # ★ 预测实验终值 Y（多项式回归 y1~y4 → Y）
 ├── optimize.py                     # ★ 控制优化：固定过去 → 搜索 x3/x4/x6/x8 → 最大化 y4
 ├── visualize.py                    # ★ 可视化：x1-x8 预测、y1-y4 预测、优化前后对比
 ├── per_file_prediction_stats.py    # ★ 每个文件的预测偏差统计（按文件夹分组）
@@ -96,6 +97,56 @@ python src/train_forecaster.py --epochs 25 --batch-size 32 --y4-boost 3.0
 - `scalers.npz` — x 标准化器
 - `test_metrics.json` — 测试集 RMSE（含分维度）
 - `test_predictions.npz` — 测试集预测结果
+
+### 3.5. 预测实验终值 Y（多项式回归 `train_y_poly.py`）
+
+`train_y_poly.py` 不预测未来时序，而是用中间目标 y1~y4（+ 可选 x1~x8 衍生特征）做多项式回归，
+拟合每个实验的**最终结果 Y**（标量）。管线：`StandardScaler → PolynomialFeatures(degree 2/3) → Ridge`。
+
+```bash
+python src/train_y_poly.py --degree 2 --mode last
+python src/train_y_poly.py --degree 2 --mode window --window 4
+python src/train_y_poly.py --degree 2 --per-group
+```
+
+三种模式区别：
+
+| 模式 | 特征 | 训练方式 |
+| --- | --- | --- |
+| `--mode last` | y1~y4 最后一个有效值 → 4 特征 | 全局单模型（train+val 训练 / test 评估） |
+| `--mode window` | y1~y4 最后 N 个观测 → N×4 特征 | 全局单模型 |
+| `--per-group` | 每个 y/x 列的 last/mean/delta，按组挑 top-8 | 每组一个独立模型（组内 80/20） |
+
+常用参数：`--degree {2,3}`（多项式阶数）、`--alpha`（默认 RidgeCV 自动选）、
+`--drop-y4`（去掉与 y3 共线的 y4）、`--seed`、`--base-dir`、`--out-dir`。
+
+#### 各模式一键对比（`run_y_poly_compare.sh`）
+
+```bash
+bash run_y_poly_compare.sh   # 在仓库根目录执行
+```
+
+脚本循环跑 8 个组合（last/window/per-group × degree 2/3 + drop-y4 变体），
+输出到 `src/model_out_compare/`，并在末尾打印对比表（组合可在脚本顶部 `RUNS` 数组里增删）。
+
+| degree | mode | RMSE | MAE | R² |
+| --- | --- | --- | --- | --- |
+| 2 | per-group | **67.1** | **53.9** | 0.298 |
+| 3 | window n=8 | 84.1 | 71.8 | **0.491** |
+| 2 | last | 101.5 | 76.0 | 0.257 |
+| 2 | last (drop-y4) | 108.2 | 81.1 | 0.157 |
+| 2 | window n=4 | 113.2 | 82.6 | 0.076 |
+| 2 | window n=8 | 115.1 | 77.8 | 0.046 |
+| 3 | last | 116.1 | 82.8 | 0.028 |
+| 3 | per-group | 249.2 | 92.2 | -8.677 |
+
+**结论**：
+
+- `per-group`(deg2) RMSE 最低（67.1）——「每组专属特征 + 独立模型」有效；
+- `window n=8 + deg3` 的 R² 最高（0.491），是全局模型里最均衡的选择；
+- `--drop-y4` 反而更差（R² 0.257→0.157）——y4 信息有价值，不建议去掉；
+- window deg2 比 last 更差：特征维度升高但 RidgeCV 选的 α 过大导致欠拟合，升到 deg3 才发挥窗口优势；
+- `per-group deg3` 严重过拟合（G2 RMSE 达 524）——分组样本少 + 56 个多项式特征，分组模式不建议用三次项。
 
 ### 4. 控制优化（**本轮暂停**）
 
