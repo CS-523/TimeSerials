@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from typing import List, Tuple
+from dataclasses import dataclass
+from typing import Tuple
 
 import torch
 
@@ -29,24 +29,6 @@ class Config:
     TRAIN_RATIO: float = 0.8
     X_COLS: Tuple[str, ...] = ("x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8")
     Y_COLS: Tuple[str, ...] = ("y1", "y2", "y3", "y4")
-    DECISION_COLS: Tuple[str, ...] = ("x3", "x4", "x6", "x8")  # for MPC
-    FIXED_INPUT_COLS: Tuple[str, ...] = ("x1", "x2", "x5")  # held fixed in MPC
-
-    # ---- Variable ranges observed in data (used as MPC bounds & sanity checks) ----
-    VAR_RANGES: dict = field(default_factory=lambda: {
-        "x1": (6.0, 8.5),
-        "x2": (370.0, 445.0),
-        "x3": (0.0, 110.0),
-        "x4": (26.0, 36.0),
-        "x5": (0.0, 110.0),
-        "x6": (5_000.0, 50_000.0),
-        "x7": (0.0, 150_000.0),  # monotonic increasing cumulative
-        "x8": (0.0, 1500.0),
-        "y1": (0.0, 100.0),
-        "y2": (0.0, 500.0),
-        "y3": (0.0, 12_000.0),
-        "y4": (0.0, 10_000.0),
-    })
 
     # ---- Model ----
     N_STATE: int = 16         # linear SS state dim
@@ -65,15 +47,6 @@ class Config:
     PATIENCE: int = 30
     GRAD_CLIP: float = 1.0
     VAL_RATIO: float = 0.15
-
-    # ---- Optimization ----
-    OPT_HORIZON: int = 16
-    OPT_WEIGHTS: List[Tuple[float, float]] = field(default_factory=lambda: [
-        (1.0, 0.0), (0.7, 0.3), (0.5, 0.5), (0.3, 0.7), (0.0, 1.0),
-    ])
-    OPT_N_STARTS: int = 5
-    OPT_LR: float = 0.05
-    OPT_MAX_ITER: int = 200
 
     # ---- Plotting ----
     FIGSIZE: Tuple[int, int] = (8, 5)

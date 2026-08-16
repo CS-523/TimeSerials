@@ -35,7 +35,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from src_control.config import get_config, resolve_paths
 from src_control.models.state_space import n4sid
-from src_control.models.state_space_nn import SS_NN_Hybrid, YHead, init_hybrid_from_n4sid
+from src_control.models.state_space_nn import SS_NN_Hybrid, init_hybrid_from_n4sid
 from src_control.preprocess import load_processed
 from src_control.utils.metrics import per_variable_metrics
 from src_control.utils.seed import set_seed
@@ -163,9 +163,7 @@ def main() -> None:
         dim_u=8, dim_y=4, n_state=args.n_state, hidden=args.hidden, window=4
     )
     init_hybrid_from_n4sid(model, type("M", (), {"A": A, "B": B, "C": C, "D": D})())
-    yhead = YHead(window=8)
     model = model.to(device)
-    yhead = yhead.to(device)
 
     # Loaders
     train_loader, val_loader = make_loaders(
@@ -173,7 +171,7 @@ def main() -> None:
     )
 
     optim = torch.optim.AdamW(
-        list(model.parameters()) + list(yhead.parameters()),
+        list(model.parameters()),
         lr=args.lr, weight_decay=1e-4,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs, eta_min=1e-5)
@@ -192,19 +190,7 @@ def main() -> None:
             optim.zero_grad()
             # Pure x → y: no teacher forcing, no y-feedback.
             y_pred = model(X, y_prev=None, teacher_forcing=0.0)
-            loss_pred = masked_mse(y_pred, Y, M)
-            # Y head: regress last 8 timesteps of y → final Y.
-            # Input is detached from the main model, so loss_y trains only
-            # `yhead` and never backprops into y1–y4 predictions.
-            with torch.no_grad():
-                yp_tail = y_pred.detach()[:, -8:, :]
-            y_pred_for_head = torch.cat([Y[:, :-8, :], yp_tail], dim=1)[:, -8:, :]
-            y_final_true = (Y * M).sum(dim=(1, 2)) / M.sum(dim=(1, 2)).clamp_min(1.0)
-            y_pred_final = yhead(y_pred_for_head)
-            loss_y = (y_pred_final - y_final_true) ** 2
-            loss_y = loss_y.mean()
-
-            loss = loss_pred + 0.1 * loss_y
+            loss = masked_mse(y_pred, Y, M)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
@@ -229,7 +215,7 @@ def main() -> None:
         if val_loss < best_val - 1e-6:
             best_val = val_loss
             no_improve = 0
-            torch.save({"model": model.state_dict(), "yhead": yhead.state_dict()},
+            torch.save({"model": model.state_dict()},
                        out_dir / "ss_nn_best.pt")
             print(f"  saved → {(out_dir / 'ss_nn_best.pt').resolve()}")
         else:
@@ -243,7 +229,7 @@ def main() -> None:
             break
 
     # Save last
-    torch.save({"model": model.state_dict(), "yhead": yhead.state_dict()},
+    torch.save({"model": model.state_dict()},
                out_dir / "ss_nn_last.pt")
     print(f"  saved → {(out_dir / 'ss_nn_last.pt').resolve()}")
 
@@ -257,7 +243,6 @@ def main() -> None:
     print("Evaluating on test set…")
     ckpt = torch.load(out_dir / "ss_nn_best.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
-    yhead.load_state_dict(ckpt["yhead"])
     model.eval()
 
     Xt = torch.tensor(test["X"], dtype=torch.float32).to(device)

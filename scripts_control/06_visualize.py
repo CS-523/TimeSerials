@@ -8,7 +8,6 @@ Usage::
         --test data/processed/test.npz \
         --preds results/predictions/test_predictions.npz \
         --scalers data/processed/scalers.npz \
-        --pareto results/metrics/pareto.json \
         --out-dir src_control/analysis_out \
         --n-samples 2
 
@@ -17,19 +16,17 @@ Reads the trained SS-NN model and test-set predictions, then draws:
   1. ``forecast_x1_x8.png``     — true vs predicted x1..x8 for 2 samples
   2. ``forecast_y1_y4.png``     — true vs predicted y1..y4 for 2 samples
   3. ``error_distribution.png`` — residuals histogram + truth-vs-pred scatter
-  4. ``optimization_compare.png`` — MPC baseline vs optimized y4 (if available)
 
 Outputs go to ``src_control/analysis_out/`` by default (configurable via
 ``--out-dir``).
 
 The script does not require re-training; it consumes the artifacts already
 produced by ``scripts_control.03_train_predictor`` and
-``scripts_control.04_optimize``.
+``scripts_control.08_train_x_model``.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -43,7 +40,7 @@ import numpy as np
 import torch
 
 from src_control.config import get_config, resolve_paths
-from src_control.models.state_space_nn import SS_NN_Hybrid, YHead
+from src_control.models.state_space_nn import SS_NN_Hybrid
 from src_control.preprocess import load_processed
 from src_control.utils.metrics import mse, mae, r2
 from src_control.utils.seed import set_seed
@@ -75,7 +72,7 @@ DEFAULT_OUT_DIR = os.path.join(_repo_root, "src_control", "analysis_out")
 def _warn_missing(artifact: str, path: str, consequence: str) -> None:
     """Emit a prominent, non-silent warning for a missing optional artifact.
 
-    Optional artifacts (y model, x model, preds, pareto JSON) are skipped so
+    Optional artifacts (y model, x model, preds) are skipped so
     the script can still draw whatever *is* available, but the skip must never
     be silent — it goes to stderr with an explicit WARNING banner.
     """
@@ -88,7 +85,7 @@ def _warn_missing(artifact: str, path: str, consequence: str) -> None:
 
 def _load_model_and_data(
     ckpt_path: str, test_npz: str, scalers_npz: str, device: str, skipped: List[str]
-) -> Tuple[Optional[SS_NN_Hybrid], Optional[YHead], Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+) -> Tuple[Optional[SS_NN_Hybrid], Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     test = load_processed(test_npz)
     scaler = np.load(scalers_npz)
 
@@ -96,18 +93,14 @@ def _load_model_and_data(
         _warn_missing("y model checkpoint", ckpt_path,
                       "y panels + forecast_y1_y4.png will be skipped")
         skipped.append(f"y model checkpoint: {ckpt_path}")
-        return None, None, test, scaler
+        return None, test, scaler
 
     ckpt = torch.load(ckpt_path, map_location=device)
     model = SS_NN_Hybrid(dim_u=8, dim_y=4, n_state=16, hidden=128, window=4)
     model.load_state_dict(ckpt["model"])
-    yhead = YHead(window=8)
-    yhead.load_state_dict(ckpt["yhead"])
     model = model.to(device)
-    yhead = yhead.to(device)
     model.eval()
-    yhead.eval()
-    return model, yhead, test, scaler
+    return model, test, scaler
 
 
 def _predict_one(
@@ -136,7 +129,7 @@ def _load_x_model(ckpt_path: str, device: str, skipped: List[str]) -> Optional[S
 
     ``checkpoints/x_forecast_best.pt`` stores a raw ``state_dict`` (from
     ``scripts_control.08_train_x_model``), unlike the y checkpoint which wraps
-    ``{"model": ..., "yhead": ...}``.
+    ``{"model": ...}``.
     """
     if not os.path.exists(ckpt_path):
         _warn_missing("x-forecast model checkpoint", ckpt_path,
@@ -362,59 +355,6 @@ def plot_error_distribution(
 
 
 # --------------------------------------------------------------------------- #
-# 4) Optimization compare
-# --------------------------------------------------------------------------- #
-def plot_optimization_compare(
-    pareto_json: str,
-    out_path: str,
-    skipped: List[str],
-) -> None:
-    """Plot baseline vs optimized y4 (Pareto points highlighted)."""
-    if not os.path.exists(pareto_json):
-        _warn_missing("Pareto JSON", pareto_json,
-                      "optimization_compare.png will be skipped")
-        skipped.append(f"Pareto JSON: {pareto_json}")
-        return
-    with open(pareto_json) as f:
-        data = json.load(f)
-    points = np.array(data["all_points"])
-    baselines = np.array(data["baselines"])
-    pareto_idx = set(data["pareto_indices"])
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    ax = axes[0]
-    ax.scatter(points[:, 0], points[:, 1], c="#4C72B0", alpha=0.5, s=30,
-                label="weighted runs")
-    if pareto_idx:
-        pareto_pts = np.array([points[i] for i in pareto_idx])
-        ax.scatter(pareto_pts[:, 0], pareto_pts[:, 1], c="#C44E52", s=80,
-                    edgecolor="black", label="Pareto front")
-    ax.scatter(baselines[:, 0], baselines[:, 1], c="#DD8452", s=160, marker="*",
-                edgecolor="black", label="baseline (last-input)")
-    ax.set_xlabel("Σ y4 over horizon")
-    ax.set_ylabel("Predicted final Y")
-    ax.set_title("Optimization scatter")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[1]
-    means = [baselines[:, 0].mean(), points[:, 0].mean()]
-    stds = [baselines[:, 0].std(), points[:, 0].std()]
-    ax.bar(["baseline", "optimized"], means, yerr=stds,
-           color=["#8172B2", "#55A467"], edgecolor="black")
-    improvement = 100 * (means[1] - means[0]) / max(abs(means[0]), 1e-9)
-    ax.set_title(f"y4 Σ mean  (improvement {improvement:+.1f}%)")
-    ax.set_ylabel("Σ y4")
-    ax.grid(True, alpha=0.3, axis="y")
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"[viz] wrote {out_path}")
-
-
-# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main() -> None:
@@ -429,11 +369,9 @@ def main() -> None:
     parser.add_argument("--preds", default=None,
                         help="Test predictions npz (default: <out-root>/results/predictions/test_predictions.npz).")
     parser.add_argument("--scalers", default="data/processed/scalers.npz")
-    parser.add_argument("--pareto", default=None,
-                        help="Pareto JSON (default: <out-root>/results/metrics/pareto.json).")
     parser.add_argument("--out-root", default=None,
                         help="Root for model/prediction artifacts. When set, --ckpt/--x-ckpt/"
-                             "--preds/--pareto default to <out-root>/checkpoints/... and "
+                             "--preds default to <out-root>/checkpoints/... and "
                              "<out-root>/results/... (e.g. --out-root scripts_control).")
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR,
                          help=f"Output directory (default: {DEFAULT_OUT_DIR})")
@@ -445,7 +383,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    # Resolve artifact paths: an explicit --ckpt/--x-ckpt/--preds/--pareto wins;
+    # Resolve artifact paths: an explicit --ckpt/--x-ckpt/--preds wins;
     # otherwise they default under --out-root (mirrors 08_train_x_model's output).
     out_root = Path(args.out_root) if args.out_root else None
 
@@ -457,7 +395,6 @@ def main() -> None:
     ckpt = _artifact("checkpoints/ss_nn_best.pt", args.ckpt)
     x_ckpt = _artifact("checkpoints/x_forecast_best.pt", args.x_ckpt)
     preds = _artifact("results/predictions/test_predictions.npz", args.preds)
-    pareto = _artifact("results/metrics/pareto.json", args.pareto)
 
     set_seed(args.seed)
     cfg = resolve_paths(get_config())
@@ -469,7 +406,7 @@ def main() -> None:
     device = cfg.DEVICE
     print(f"[viz] device: {device}")
     skipped: List[str] = []
-    model, yhead, test, scaler = _load_model_and_data(
+    model, test, scaler = _load_model_and_data(
         ckpt, args.test, args.scalers, device, skipped
     )
     x_model = _load_x_model(x_ckpt, device, skipped)
@@ -507,10 +444,6 @@ def main() -> None:
         _warn_missing("test predictions npz", preds,
                       "error_distribution.png will be skipped")
         skipped.append(f"test predictions npz: {preds}")
-
-    plot_optimization_compare(
-        pareto, out_path=out_dir / "optimization_compare.png", skipped=skipped,
-    )
 
     if skipped:
         print("\n" + "=" * 62, file=sys.stderr)

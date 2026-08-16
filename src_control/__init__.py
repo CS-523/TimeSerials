@@ -5,7 +5,6 @@ Modules:
     preprocess         : cleaning, missing-value handling, scaling, splitting
     analysis           : correlation / MI / PCA / lag analysis
     models             : linear state-space (N4SID/Kalman) and hybrid SS-NN
-    optimization       : MPC and Pareto-frontier optimizer over (x3,x4,x6,x8)
     visualization      : plotting helpers
     utils              : metrics, seeding
 

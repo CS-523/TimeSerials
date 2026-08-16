@@ -1,6 +1,6 @@
 """End-to-end smoke test for the modern control theory pipeline.
 
-Runs the four main scripts with reduced parameters so the full pipeline
+Runs the three main scripts with reduced parameters so the full pipeline
 finishes in a few minutes. Useful as a CI check and as a quick "does
 everything work?" confirmation after code changes.
 
@@ -30,7 +30,7 @@ def main() -> None:
             d.mkdir(parents=True, exist_ok=True)
 
         # 1. Preprocess
-        print("\n[1/4] preprocess…")
+        print("\n[1/3] preprocess…")
         subprocess.run(
             [sys.executable, "-m", "src_control.preprocess",
              "--out", str(data_dir), "--seq-len", "128"],
@@ -38,7 +38,7 @@ def main() -> None:
         )
 
         # 2. Feature analysis
-        print("\n[2/4] feature analysis…")
+        print("\n[2/3] feature analysis…")
         subprocess.run(
             [sys.executable, "-m", "src_control.analysis.correlation",
              "--data", str(data_dir / "train.npz"),
@@ -47,7 +47,7 @@ def main() -> None:
         )
 
         # 3. Train predictor (only 5 epochs to keep runtime short)
-        print("\n[3/4] train predictor (5 epochs)…")
+        print("\n[3/3] train predictor (5 epochs)…")
         subprocess.run(
             [sys.executable, "-m", "scripts_control.03_train_predictor",
              "--data", str(data_dir / "train.npz"),
@@ -61,20 +61,7 @@ def main() -> None:
             check=True,
         )
 
-        # 4. MPC optimization (1 sample, 1 start, short horizon)
-        print("\n[4/4] MPC optimization (1 sample, horizon=8)…")
-        subprocess.run(
-            [sys.executable, "-m", "scripts_control.04_optimize",
-             "--ckpt", str(ckpt_dir / "ss_nn_best.pt"),
-             "--data", str(data_dir / "test.npz"),
-             "--scalers", str(data_dir / "scalers.npz"),
-             "--n-samples", "1", "--horizon", "8", "--n-starts", "1",
-             "--out-metrics", str(metrics_dir),
-             "--out-figures", str(figures_dir)],
-            check=True,
-        )
-
-        # 5. Verify expected outputs exist
+        # 4. Verify expected outputs exist
         print("\n[verify] checking outputs…")
         expected = [
             data_dir / "aligned_dataset.npz",
@@ -85,7 +72,6 @@ def main() -> None:
             ckpt_dir / "ss_nn_last.pt",
             metrics_dir / "training_log.json",
             metrics_dir / "test_metrics.json",
-            metrics_dir / "pareto.json",
             preds_dir / "test_predictions.npz",
             figures_dir / "correlation_heatmap.png",
             figures_dir / "mi_heatmap.png",
@@ -93,7 +79,6 @@ def main() -> None:
             figures_dir / "lag_x_to_y4.png",
             figures_dir / "granger_xy.png",
             figures_dir / "analysis_report.json",
-            figures_dir / "pareto_frontier.png",
         ]
         missing = [p for p in expected if not p.exists()]
         if missing:

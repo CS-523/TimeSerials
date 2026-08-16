@@ -8,7 +8,6 @@
 |---|---|---|
 | `03_train_predictor.py` | 训练 y1–y4 预测模型（线性 SS + NN 残差） | `checkpoints/ss_nn_best.pt` 等 |
 | `08_train_x_model.py` | 训练独立的 x1–x8 多步外推预测模型 | `checkpoints/x_forecast_best.pt` 等 |
-| `04_optimize.py` | MPC Pareto 优化（决策变量 x3/x4/x6/x8） | `results/metrics/pareto.json` 等 |
 | `06_visualize.py` | 综合可视化（y 预测 / x̂ 外推，两者都可选） | `src_control/analysis_out/*.png` |
 | `07_ppt_figures.py` | 生成 8 张中文标注的 PPT 图 | `src_control/analysis_out/ppt/*.png` |
 | `05_smoke_test.py` | 端到端冒烟测试（临时目录，几分钟） | 无（临时目录自动清理） |
@@ -55,7 +54,7 @@ python -m scripts_control.03_train_predictor \
 
 ## 2. 训练 x1–x8 多步外推预测模型（可选、独立）
 
-默认模型只预测 y。若要**也让 x1–x8 有未来预测值**（多步外推），另训一个输出维度换成 8 的独立模型——训练用 teacher forcing、推理用真正的自回归 rollout，**不影响 y 模型与 MPC**：
+默认模型只预测 y。若要**也让 x1–x8 有未来预测值**（多步外推），另训一个输出维度换成 8 的独立模型——训练用 teacher forcing、推理用真正的自回归 rollout，**不影响 y 模型**：
 
 ```bash
 # 加 --out-root 可把模型输出一键放进 scripts_control/（见下方说明）
@@ -74,23 +73,9 @@ python -m scripts_control.08_train_x_model \
 
 训练完成后即可加载做推理，详见下方「加载 x 模型做未来外推」。
 
-## 3. MPC Pareto 优化
+## 3. 综合可视化
 
-加载 y 模型，对测试集样本优化 `(x3, x4, x6, x8)` 以最大化 `Σy4` 与预测 `Y`：
-
-```bash
-python -m scripts_control.04_optimize \
-    --ckpt checkpoints/ss_nn_best.pt \
-    --data data/processed/test.npz \
-    --scalers data/processed/scalers.npz \
-    --n-samples 10 --horizon 16 --n-starts 3
-```
-
-- 产物：`results/metrics/pareto.json`、`results/figures/pareto_frontier.png`、`results/figures/optimized_vs_baseline_<idx>.png`
-
-## 4. 综合可视化
-
-画预测叠加图、误差分布、优化对比。**y 模型和 x 模型都是可选的**——哪个 checkpoint 存在就画哪个：
+画预测叠加图、误差分布。**y 模型和 x 模型都是可选的**——哪个 checkpoint 存在就画哪个：
 
 ```bash
 # 模型产物在 scripts_control/ 下时（08 用了 --out-root scripts_control），这里同样加 --out-root
@@ -100,16 +85,16 @@ python -m scripts_control.06_visualize \
     --out-root scripts_control
 ```
 
-- `--out-root <dir>`：模型/产物查找根目录，`--ckpt`/`--x-ckpt`/`--preds`/`--pareto` 默认取 `<dir>/checkpoints/...`、`<dir>/results/...`；与 08 训练脚本的 `--out-root` 对应，两侧用同一个目录即可
+- `--out-root <dir>`：模型/产物查找根目录，`--ckpt`/`--x-ckpt`/`--preds` 默认取 `<dir>/checkpoints/...`、`<dir>/results/...`；与 08 训练脚本的 `--out-root` 对应，两侧用同一个目录即可
 - `--ckpt`（y 模型）默认 `<out-root>/checkpoints/ss_nn_best.pt`（不传 `--out-root` 时是 `checkpoints/ss_nn_best.pt`），缺失时跳过 `forecast_y1_y4.png`
 - `--x-ckpt`（x 模型）默认 `<out-root>/checkpoints/x_forecast_best.pt`，缺失时跳过 x̂ 外推
 - `--context C` / `--horizon H`：x 外推的上下文长度 / 步数，需与 08 训练时一致（默认 32/32）
 - 两个都不存在则直接退出并提示；缺哪个都会在 stderr 打印 `WARNING` 并在末尾汇总
 - 产物（默认到 `src_control/analysis_out/`）：
   - `forecast_x1_x8.png` — x1..x8 历史 + 未来外推预测（红色虚线，浅灰点线为真实未来）；仅画 x，y 预测在下面独立图里
-  - `forecast_y1_y4.png`（仅 y 模型存在时）、`error_distribution.png`、`optimization_compare.png`
+  - `forecast_y1_y4.png`（仅 y 模型存在时）、`error_distribution.png`
 
-## 5. PPT 图
+## 4. PPT 图
 
 生成 8 张中文标注的 PPT 图（`--figs` 可指定图号子集，如 `1,2,5`）：
 
@@ -121,9 +106,9 @@ python -m scripts_control.07_ppt_figures \
 
 产物：`src_control/analysis_out/ppt/*.png`
 
-## 6. 端到端冒烟测试
+## 5. 端到端冒烟测试
 
-在临时目录跑完整流水线（预处理 + 训练 + 优化），验证不报错：
+在临时目录跑完整流水线（预处理 + 特征分析 + 训练），验证不报错：
 
 ```bash
 python -m scripts_control.05_smoke_test
@@ -134,11 +119,11 @@ python -m scripts_control.05_smoke_test
 ## 典型工作流顺序
 
 ```
-preprocess ──► 03 训练 y 模型 ──► 04 优化 ──► 06 可视化
-preprocess ──► 08 训练 x 模型 ─────────────► 06 可视化（只画 x 也行）
+preprocess ──► 03 训练 y 模型 ──► 06 可视化
+preprocess ──► 08 训练 x 模型 ──► 06 可视化（只画 x 也行）
 ```
 
-两条路径相互独立：只预测 x 就只跑 08（完全不需要 03/04）。
+两条路径相互独立：只预测 x 就只跑 08（完全不需要 03）。
 
 ---
 

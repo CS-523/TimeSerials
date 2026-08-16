@@ -7,7 +7,7 @@ qualitative scheme inspired by the dataviz skill defaults — `#4C72B0`
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Optional
 
 import matplotlib
 
@@ -90,64 +90,6 @@ def plot_prediction_overlay_grid(
             ax.set_title(f"sample {idx} — {name}", fontsize=9)
             ax.grid(alpha=0.3)
         axes[0, col].legend(fontsize=7)
-    _save(fig, out_path)
-
-
-# --------------------------------------------------------------------------- #
-# MPC / Pareto
-# --------------------------------------------------------------------------- #
-def plot_pareto(
-    points: list[tuple[float, float]],
-    baseline: Optional[Tuple[float, float]],
-    out_path: str | Path,
-    title: str = "Pareto frontier (y4_sum vs Y)",
-) -> None:
-    fig, ax = plt.subplots(figsize=(8, 6))
-    if points:
-        arr = np.asarray(points)
-        ax.scatter(arr[:, 0], arr[:, 1], c=PALETTE[0], s=40, alpha=0.7,
-                    label="optimized")
-    if baseline is not None:
-        ax.scatter([baseline[0]], [baseline[1]], c=PALETTE[3], s=160,
-                    marker="*", zorder=10, label="baseline (last-input policy)")
-    ax.set_xlabel("Σ y4 over horizon")
-    ax.set_ylabel("Predicted final Y")
-    ax.set_title(title)
-    ax.grid(alpha=0.3)
-    ax.legend()
-    _save(fig, out_path)
-
-
-def plot_optimized_trajectory(
-    u_opt: np.ndarray,
-    u_base: np.ndarray,
-    y_opt: np.ndarray,
-    y_base: np.ndarray,
-    sample_idx: int,
-    out_path: str | Path,
-    decision_names: Tuple[str, ...] = ("x3", "x4", "x6", "x8"),
-) -> None:
-    """Two-panel: decision vars and y4 trajectories for opt vs baseline."""
-    H = u_opt.shape[0]
-    fig, axes = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
-    for j, name in enumerate(decision_names):
-        axes[0].plot(np.arange(H), u_opt[:, j], color=PALETTE[j],
-                      lw=1.5, label=f"{name} (opt)")
-        axes[0].plot(np.arange(H), u_base[:, j], color=PALETTE[j], lw=1.5,
-                      ls="--", label=f"{name} (base)")
-    axes[0].set_ylabel("decision variables")
-    axes[0].legend(fontsize=7, ncol=2)
-    axes[0].grid(alpha=0.3)
-
-    axes[1].plot(np.arange(H), y_opt[:, 3], color=PALETTE[0], lw=1.5,
-                  label="y4 (opt)")
-    axes[1].plot(np.arange(H), y_base[:, 3], color=PALETTE[0], lw=1.5,
-                  ls="--", label="y4 (base)")
-    axes[1].set_ylabel("y4")
-    axes[1].set_xlabel("horizon step")
-    axes[1].legend()
-    axes[1].grid(alpha=0.3)
-    fig.suptitle(f"Optimized vs baseline trajectories (sample {sample_idx})")
     _save(fig, out_path)
 
 
