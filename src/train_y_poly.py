@@ -1,16 +1,40 @@
 """
-Polynomial regression: fit Y from y1-y4 (degree 2 / 3)
-========================================================
-Two feature modes:
-  --mode last   : last valid y1-y4 value per experiment -> 4 raw features
-  --mode window : last N observations of y1-y4 -> N*4 raw features (default N=4)
+Polynomial regression: 用 y1~y4（+ 可选 x1~x8 衍生特征）拟合实验终值 Y
+==========================================================================
+原理：StandardScaler → PolynomialFeatures(degree 2/3) → Ridge，把中间目标 y1~y4
+      非线性地回归到最终结果 Y。Y 是每个实验的终值标量（非时序），模型拟合的是
+      "实验早/中期信号 → 实验终值" 的映射，而非预测未来时序。
 
-Uses PolynomialFeatures + Ridge to nonlinearly regress the final Y.
+三种训练配置（互斥）：
+  --mode last      : 全局模型。每个实验取 y1~y4 的最后一个有效值 → 4 个特征。
+  --mode window    : 全局模型。取 y1~y4 的最后 N 个观测 → N×4 个特征（--window，默认 4）。
+  --per-group      : 每组一个模型。为每个 y/x 列算 last/mean/delta 衍生特征，再按
+                     GROUP_FEATURES 给每组挑 top-8 特征，各组独立训练 Ridge。
+                     （此开关优先级高于 --mode，会自动改用 engineered 特征）
+
+常用参数：
+  --degree {2,3}   多项式阶数（默认 2）
+  --alpha FLOAT    岭回归正则强度；默认不指定，由 RidgeCV 自动选择
+  --drop-y4        只保留 y1~y3（y3/y4 高度共线）
+  --seed INT       数据划分随机种子（默认 42）
+  --base-dir       数据根目录（含 1/..5/ 子目录，默认 .）
+  --out-dir        输出目录（默认 ./src/model_out）
+
+划分方式：
+  全局模型  : split_experiments 按实验 7:1:2 → train/val/test，train+val 训练、test 评估。
+  每组模型  : 每组内 80/20 划分训练/测试，最终指标按组汇总。
 
 Usage:
     python src/train_y_poly.py --degree 2 --mode last
     python src/train_y_poly.py --degree 2 --mode window --window 4
-    python src/train_y_poly.py --degree 2 --mode window --window 8
+    python src/train_y_poly.py --degree 3 --mode window --window 8 --drop-y4
+    python src/train_y_poly.py --degree 2 --per-group
+
+输出（写入 --out-dir，tag = deg{degree}_{mode}）：
+  y_poly_{tag}.pkl              训练好的 Pipeline / 分组 Pipeline dict
+  y_poly_{tag}_metrics.json     RMSE/MAE/R² + 每组细分
+  y_poly_{tag}_predictions.csv  逐样本 Y_true / Y_pred
+  y_poly_{tag}.png              预测散点 + 残差图
 """
 from __future__ import annotations
 

@@ -109,13 +109,62 @@ python src/optimize.py   # 仅打印"已停用"提示
 ### 5. 可视化
 
 ```bash
-python src/visualize.py
+python src/visualize.py --base-dir /remote-home/sunxiaoting/ybkong/timserials/time-serials-mac
+```
+
+> ⚠️ `visualize.py` 的 `--base-dir` 默认值是写死的旧路径 `/kefu-nas/ybkong/time_serials-master`，
+> 不会自动指向当前仓库。务必显式传入 `--base-dir <仓库根目录>`，否则会报
+> `FileNotFoundError: 找不到 checkpoint`。
+>
+> 可选参数：`--backbone lstm|pathint`（默认 `lstm`）、`--mode shared|group_head|independent`（默认 `group_head`）、
+> `--ckpt <路径>` 手动指定 checkpoint（否则自动在 `src/model_out/` 里按命名规则查找）。
+
+**两种预测锚定方式**：
+
+1. **默认（输入锚定）**：输入窗口恒为序列开头 `in_len` 步，预测紧接输入之后 `T_out` 步。
+2. **尾部锚定（`--tail-anchor`）**：`s = T − H`，历史画 `[0, s)`，预测画 `[s, s+H)`，
+   输入窗口取 `s` 前最后 `in_len` 步——与 `scripts_control/06_visualize` 的外推语义一致。
+
+```bash
+# 尾部锚定，且 in_len/视野 与 scripts_control 的 --context 32 --horizon 32 对齐
+python src/visualize.py --base-dir <仓库根目录> \
+    --backbone lstm --mode group_head \
+    --tail-anchor --in-len 32 --t-out 32
+```
+
+新增参数：
+
+| 参数             | 默认     | 说明             |
+| ---------------- | -------- | ---------------- |
+| `--in-len`     | 24       | 输入窗口长度（历史/上下文步数） |
+| `--t-out`      | 16       | 预测视野 H（外推步数）         |
+| `--tail-anchor`| 关       | 尾部锚定（见上）；开启时忽略 `--pred-start` |
+| `--pred-start` | 输入长度 | 预测区间起点（仅非 tail-anchor 时有效） |
+| `--split`      | test     | 用哪个 split 画图 + 算 RMSE：train/val/test（非 test 时输出名加 `_{split}` 后缀） |
+
+**六路模型命令**（`--backbone × --mode` → 6 个模型类；每条命令都可追加 `--tail-anchor` 做尾部锚定）：
+
+| backbone | mode | 模型类 | 命令 |
+| --- | --- | --- | --- |
+| `lstm` | `shared` | `LSTMForecaster` | `python src/visualize.py --backbone lstm --mode shared` |
+| `lstm` | `group_head` | `LSTMForecasterFiLM` | `python src/visualize.py --backbone lstm --mode group_head` |
+| `lstm` | `independent` | `LSTMForecaster5Models` | `python src/visualize.py --backbone lstm --mode independent` |
+| `pathint` | `shared` | `PathIntegratorForecaster` | `python src/visualize.py --backbone pathint --mode shared` |
+| `pathint` | `group_head` | `PathIntegratorForecasterFiLM` | `python src/visualize.py --backbone pathint --mode group_head` |
+| `pathint` | `independent` | `PathIntegratorForecaster5Models` | `python src/visualize.py --backbone pathint --mode independent` |
+
+例如尾部锚定 + 长上下文外推：
+
+```bash
+python src/visualize.py --base-dir /remote-home/sunxiaoting/ybkong/timserials/time-serials-mac \
+    --backbone lstm --mode group_head \
+    --tail-anchor --in-len 32 --t-out 32
 ```
 
 **输出**（`src/analysis_out/`）：
 
-- `forecast_x1_x8.png` — 真实 vs 预测的 x1-x8
-- `error_per_dim.png` — 分维度 RMSE 柱状图
+- `forecast_x1_x8_{backbone}_{mode}.png` — 真实 vs 预测的 x1-x8
+- `error_per_dim_{backbone}_{mode}.png` — 分维度 RMSE 柱状图
 
 ### 5.5. 每个文件预测偏差统计（按文件夹分组）
 

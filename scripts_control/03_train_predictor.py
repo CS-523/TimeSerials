@@ -1,5 +1,9 @@
 """Train the hybrid SS-NN predictor on the processed dataset.
 
+The model is a pure x → y feedforward mapping (no teacher forcing, no
+autoregressive y-feedback): predictions come only from the exogenous inputs
+``X`` via ``model(X, y_prev=None, teacher_forcing=0.0)``.
+
 Usage::
 
     python -m scripts_control.03_train_predictor \
@@ -126,7 +130,8 @@ def main() -> None:
     parser.add_argument("--horizon", type=int, default=32)
     parser.add_argument("--n-state", type=int, default=16)
     parser.add_argument("--hidden", type=int, default=128)
-    parser.add_argument("--tf-decay", type=int, default=50)
+    parser.add_argument("--tf-decay", type=int, default=50,
+                        help="(deprecated) unused; retained for CLI compatibility")
     parser.add_argument("--patience", type=int, default=30)
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
@@ -179,24 +184,18 @@ def main() -> None:
     t0 = time.time()
 
     for epoch in range(1, args.epochs + 1):
-        # Teacher-forcing schedule: 1 → 0 over tf_decay epochs
-        tf = max(0.0, 1.0 - epoch / max(1, args.tf_decay))
         model.train()
         ep_loss = 0.0
         n_batch = 0
         for X, Y, M in train_loader:
             X = X.to(device); Y = Y.to(device); M = M.to(device)
             optim.zero_grad()
-            # 50% teacher-forced, 50% pure AR — robust to both regimes
-            use_tf = (torch.rand(1).item() < 0.5)
-            if use_tf:
-                y_pred = model(X, y_prev=Y, teacher_forcing=tf)
-            else:
-                # Pure AR: y_prev=None. Residual MLP sees [u, y_lin, y_lin].
-                y_pred = model(X, y_prev=None, teacher_forcing=0.0)
+            # Pure x → y: no teacher forcing, no y-feedback.
+            y_pred = model(X, y_prev=None, teacher_forcing=0.0)
             loss_pred = masked_mse(y_pred, Y, M)
-            # Y head: regress last 8 timesteps of y → final Y
-            y_tail = Y[:, -8:, :]
+            # Y head: regress last 8 timesteps of y → final Y.
+            # Input is detached from the main model, so loss_y trains only
+            # `yhead` and never backprops into y1–y4 predictions.
             with torch.no_grad():
                 yp_tail = y_pred.detach()[:, -8:, :]
             y_pred_for_head = torch.cat([Y[:, :-8, :], yp_tail], dim=1)[:, -8:, :]
@@ -221,12 +220,12 @@ def main() -> None:
         with torch.no_grad():
             for X, Y, M in val_loader:
                 X = X.to(device); Y = Y.to(device); M = M.to(device)
-                y_pred = model(X, y_prev=Y, teacher_forcing=1.0)
+                y_pred = model(X, y_prev=None, teacher_forcing=0.0)
                 val_loss += float(masked_mse(y_pred, Y, M).item())
                 n_v += 1
         val_loss /= max(1, n_v)
 
-        history.append({"epoch": epoch, "train": ep_loss, "val": val_loss, "tf": tf})
+        history.append({"epoch": epoch, "train": ep_loss, "val": val_loss})
         if val_loss < best_val - 1e-6:
             best_val = val_loss
             no_improve = 0
@@ -238,7 +237,7 @@ def main() -> None:
         if epoch % 5 == 0 or epoch == 1:
             elapsed = time.time() - t0
             print(f"  epoch {epoch:3d}/{args.epochs}  train={ep_loss:.4f}  val={val_loss:.4f}  "
-                  f"tf={tf:.2f}  best_val={best_val:.4f}  ({elapsed:.0f}s)")
+                  f"best_val={best_val:.4f}  ({elapsed:.0f}s)")
         if no_improve >= args.patience:
             print(f"  early stop at epoch {epoch} (no improve for {args.patience} epochs)")
             break
@@ -273,7 +272,7 @@ def main() -> None:
         for i in range(0, Xt.shape[0], bs_eval):
             xb = Xt[i : i + bs_eval]
             yb = Yt[i : i + bs_eval]
-            y_pred = model(xb, y_prev=yb, teacher_forcing=1.0)
+            y_pred = model(xb, y_prev=None, teacher_forcing=0.0)
             all_preds.append(y_pred.cpu().numpy())
             all_truths.append(yb.cpu().numpy())
     y_pred_all = np.concatenate(all_preds, axis=0)

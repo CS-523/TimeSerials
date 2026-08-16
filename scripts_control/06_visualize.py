@@ -4,7 +4,7 @@ Usage::
 
     python -m scripts_control.06_visualize \
         --ckpt checkpoints/ss_nn_best.pt \
-        --x-ckpt checkpoints/x_recon_best.pt \
+        --x-ckpt checkpoints/x_forecast_best.pt \
         --test data/processed/test.npz \
         --preds results/predictions/test_predictions.npz \
         --scalers data/processed/scalers.npz \
@@ -113,41 +113,34 @@ def _load_model_and_data(
 def _predict_one(
     model: SS_NN_Hybrid,
     x_raw: np.ndarray,         # (T, 8)
-    y_raw: np.ndarray,         # (T, 4)
-    y_mask: np.ndarray,        # (T, 4)
     scaler: Dict[str, np.ndarray],
     device: str,
-    teacher_forcing: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Run the model on a single sample and return (x_raw, y_pred_denorm)."""
+    """Run the model on a single sample (pure x → y) and return (x_raw, y_pred_denorm)."""
     x_mean = scaler["x_mean"]
     x_scale = scaler["x_scale"]
     y_mean = scaler["y_mean"]
     y_scale = scaler["y_scale"]
 
     x_std = (x_raw - x_mean) / x_scale
-    y_filled = np.where(np.isnan(y_raw), 0.0, (y_raw - y_mean) / y_scale)
-    y_std = y_filled * y_mask  # zero out non-observed
-
     x_t = torch.tensor(x_std, dtype=torch.float32, device=device).unsqueeze(0)
-    y_t = torch.tensor(y_std, dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
-        y_pred = model(x_t, y_prev=y_t, teacher_forcing=teacher_forcing)
+        y_pred = model(x_t, y_prev=None, teacher_forcing=0.0)
     y_pred_np = y_pred[0].cpu().numpy()
     y_pred_denorm = y_pred_np * y_scale + y_mean
     return x_raw, y_pred_denorm
 
 
 def _load_x_model(ckpt_path: str, device: str, skipped: List[str]) -> Optional[SS_NN_Hybrid]:
-    """Load the independent x-reconstruction model, or ``None`` if absent.
+    """Load the independent x-forecaster, or ``None`` if absent.
 
-    ``checkpoints/x_recon_best.pt`` stores a raw ``state_dict`` (from
+    ``checkpoints/x_forecast_best.pt`` stores a raw ``state_dict`` (from
     ``scripts_control.08_train_x_model``), unlike the y checkpoint which wraps
     ``{"model": ..., "yhead": ...}``.
     """
     if not os.path.exists(ckpt_path):
-        _warn_missing("x-reconstruction model checkpoint", ckpt_path,
-                      "x̂ overlay (red dashed) will be skipped")
+        _warn_missing("x-forecast model checkpoint", ckpt_path,
+                      "x̂ forecast (red dashed) will be skipped")
         skipped.append(f"x model checkpoint: {ckpt_path}")
         return None
     x_model = SS_NN_Hybrid(dim_u=8, dim_y=8, n_state=16, hidden=128, window=4)
@@ -160,18 +153,29 @@ def _load_x_model(ckpt_path: str, device: str, skipped: List[str]) -> Optional[S
 def _predict_x(
     x_model: SS_NN_Hybrid,
     x_raw: np.ndarray,          # (T, 8) raw x values
+    T: int,
+    C: int,
+    H: int,
     scaler: Dict[str, np.ndarray],
     device: str,
-) -> np.ndarray:
-    """Run the x-reconstruction model on x and return denormalized x̂ (T, 8)."""
+) -> Optional[Tuple[int, np.ndarray]]:
+    """Forecast the next H steps of x from a context of past x (autoregressive).
+
+    Returns ``(s, x_hat_denorm)`` where ``s = T − H`` is the forecast start and
+    ``x_hat_denorm`` is ``(H, 8)`` in raw x space — or ``None`` when the sample
+    is shorter than ``C + H``.
+    """
+    if T < C + H:
+        return None
     x_mean = scaler["x_mean"]
     x_scale = scaler["x_scale"]
-    x_std = (x_raw - x_mean) / x_scale
-    x_t = torch.tensor(x_std, dtype=torch.float32, device=device).unsqueeze(0)
+    x_std = (x_raw[:T] - x_mean) / x_scale
+    s = T - H
+    ctx = torch.tensor(x_std[s - C : s], dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
-        x_pred = x_model(x_t, y_prev=None, teacher_forcing=0.0)
-    x_pred_np = x_pred[0].cpu().numpy()
-    return x_pred_np * x_scale + x_mean
+        x_hat = x_model.forecast(ctx, H, x_future_gt=None, teacher_forcing=0.0)
+    x_hat_np = x_hat[0].cpu().numpy()
+    return s, x_hat_np * x_scale + x_mean
 
 
 # --------------------------------------------------------------------------- #
@@ -184,11 +188,16 @@ def plot_forecast_x(
     out_path: str,
     device: str,
     x_model: Optional[SS_NN_Hybrid] = None,
+    context: int = 32,
+    horizon: int = 32,
 ) -> None:
-    """Plot x1..x8 (history + reconstructed x̂) for the selected samples.
+    """Plot x1..x8 (history + future forecast) for the selected samples.
 
     y predictions live in ``plot_forecast_y`` / ``forecast_y1_y4.png``, so this
-    figure is x-only: 8 columns per sample.
+    figure is x-only: 8 columns per sample. The black history ends at the
+    forecast start ``s = T − H``; the red dashed forecast extends over
+    ``[s, s+H)`` (the model's autoregressive rollout), overlaid with the true
+    future in light dotted gray.
     """
     x_mean = scaler["x_mean"]
     x_scale = scaler["x_scale"]
@@ -205,17 +214,24 @@ def plot_forecast_x(
         T = int(test["lengths"][idx])
         x_raw = (X[:T] * x_scale + x_mean).astype(np.float32)
 
-        # Optional x-reconstruction overlay (independent x denoising model)
-        x_pred = _predict_x(x_model, x_raw, scaler, device) if x_model is not None else None
+        # Optional x-forecast overlay (autoregressive rollout over the tail).
+        res = _predict_x(x_model, x_raw, T, context, horizon, scaler, device) if x_model is not None else None
+        s = res[0] if res is not None else None
 
-        # x1..x8 history (black) + reconstructed x̂ (red dashed).
+        # x1..x8 history (black, up to forecast start s) + forecast (red dashed)
+        # + true future (gray dotted). When no forecast is available, the history
+        # is simply drawn over the full sequence.
         for ci, c in enumerate(X_COLS):
             ax = axes[ei, ci]
-            ax.plot(np.arange(T), x_raw[:, ci], color=COL_HISTORY, lw=1.2,
+            hist_end = s if s is not None else T
+            ax.plot(np.arange(hist_end), x_raw[:hist_end, ci], color=COL_HISTORY, lw=1.2,
                      label="history (input)")
-            if x_pred is not None:
-                ax.plot(np.arange(T), x_pred[:, ci], color=COL_PRED, lw=1.0,
-                        ls="--", alpha=0.85, label="x̂ pred")
+            if res is not None:
+                _, x_hat = res
+                ax.plot(np.arange(s, s + horizon), x_hat[:, ci], color=COL_PRED, lw=1.2,
+                        ls="--", alpha=0.85, label="forecast (AR)")
+                ax.plot(np.arange(s, T), x_raw[s:T, ci], color="0.55", lw=0.8,
+                        ls=":", alpha=0.8, label="true future")
             ax.set_title(f"{c} — samp {idx}", fontsize=9)
             ax.grid(True, alpha=0.3)
             ax.tick_params(labelsize=7)
@@ -266,8 +282,7 @@ def plot_forecast_y(
         x_raw = x_raw.astype(np.float32)
         y_raw = y_raw.astype(np.float32)
 
-        _, y_pred = _predict_one(model, x_raw, y_raw, Y_mask[:T], scaler, device,
-                                  teacher_forcing=1.0)
+        _, y_pred = _predict_one(model, x_raw, scaler, device)
 
         t = np.arange(T)
         for yi, name in enumerate(Y_NAMES):
@@ -408,8 +423,8 @@ def main() -> None:
                         help="y model checkpoint (default: <out-root>/checkpoints/ss_nn_best.pt, "
                              "or checkpoints/ss_nn_best.pt when --out-root is unset).")
     parser.add_argument("--x-ckpt", default=None,
-                        help="Optional x-reconstruction model for the x1..x8 overlay "
-                             "(default: <out-root>/checkpoints/x_recon_best.pt).")
+                        help="Optional x-forecast model for the x1..x8 forecast "
+                             "(default: <out-root>/checkpoints/x_forecast_best.pt).")
     parser.add_argument("--test", default="data/processed/test.npz")
     parser.add_argument("--preds", default=None,
                         help="Test predictions npz (default: <out-root>/results/predictions/test_predictions.npz).")
@@ -423,6 +438,10 @@ def main() -> None:
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR,
                          help=f"Output directory (default: {DEFAULT_OUT_DIR})")
     parser.add_argument("--n-samples", type=int, default=2)
+    parser.add_argument("--context", type=int, default=32,
+                        help="Context length C for the x-forecaster (must match 08_train_x_model).")
+    parser.add_argument("--horizon", type=int, default=32,
+                        help="Forecast horizon H for the x-forecaster (must match 08_train_x_model).")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -436,7 +455,7 @@ def main() -> None:
         return str(out_root / rel) if out_root else rel
 
     ckpt = _artifact("checkpoints/ss_nn_best.pt", args.ckpt)
-    x_ckpt = _artifact("checkpoints/x_recon_best.pt", args.x_ckpt)
+    x_ckpt = _artifact("checkpoints/x_forecast_best.pt", args.x_ckpt)
     preds = _artifact("results/predictions/test_predictions.npz", args.preds)
     pareto = _artifact("results/metrics/pareto.json", args.pareto)
 
@@ -469,6 +488,8 @@ def main() -> None:
         out_path=out_dir / "forecast_x1_x8.png",
         device=device,
         x_model=x_model,
+        context=args.context,
+        horizon=args.horizon,
     )
 
     if model is not None:

@@ -27,9 +27,9 @@ src_control/
 
 scripts_control/               CLI 驱动脚本（同样不与现有 scripts/ 冲突）
 ├── 03_train_predictor.py      训练 y1–y4 预测模型（线性 SS + NN 残差 + YHead）
-├── 08_train_x_model.py        训练独立的 x1–x8 去噪/重构模型
+├── 08_train_x_model.py        训练独立的 x1–x8 多步外推预测模型
 ├── 04_optimize.py             运行 Pareto MPC（决策变量 x3/x4/x6/x8）
-├── 06_visualize.py            综合可视化（y + 可选的 x̂ 叠加）
+├── 06_visualize.py            综合可视化（y + 可选的 x̂ 外推）
 ├── 07_ppt_figures.py          生成 8 张中文标注的 PPT 图
 └── 05_smoke_test.py           端到端冒烟测试（临时目录，4 步）
 
@@ -80,18 +80,17 @@ python -m src_control.analysis.correlation \
 
 ### 步骤 3 — 训练预测 y1-y4 模型
 
-用 N4SID 初始化线性 SS，再用 AdamW + 余弦退火训练混合 SS-NN 模型（mask-aware MSE + 半 teacher forcing）：
+用 N4SID 初始化线性 SS，再用 AdamW + 余弦退火训练混合 SS-NN 模型（**纯 x → y 前馈**，mask-aware MSE，无 teacher forcing）：
 
 ```bash
 python -m scripts_control.03_train_predictor \
-    --data  data/processed/train.npz \
-    --test  data/processed/test.npz  \
+    --data data/processed/train.npz \
+    --test data/processed/test.npz \
     --scalers data/processed/scalers.npz \
-    --epochs 200 --bs 16 --lr 1e-3 \
-    --tf-decay 50 --patience 30
+    --epochs 200 --bs 16 --lr 1e-3 --patience 30
 ```
 
-模型结构：`SS_NN_Hybrid(dim_u=8, dim_y=4, n_state=16, hidden=128, window=4)` —— x1–x8 是外生输入，`LinearSSTorch` 线性 SS 基线（N4SID 初始化）+ `ResidualMLP` 残差，输出 y1–y4；外加 `YHead(window=8)` 从 y 末 8 步回归最终 `Y`（总损失 = y 的 mask-aware MSE + 0.1×Y 回归 MSE）。训练每步 50% teacher-forcing、50% 纯自回归；checkpoint 为 `{"model":…, "yhead":…}` 字典。
+模型结构：`SS_NN_Hybrid(dim_u=8, dim_y=4, n_state=16, hidden=128, window=4)` —— x1–x8 是外生输入，`LinearSSTorch` 线性 SS 基线（N4SID 初始化）+ `ResidualMLP` 残差，输出 y1–y4；外加 `YHead(window=8)` 从 y 末 8 步回归最终 `Y`（总损失 = y 的 mask-aware MSE + 0.1×Y 回归 MSE）。纯 x → y 前馈：只用 x1–x8 预测 y1–y4，无 teacher forcing、无 y 自回归反馈；checkpoint 为 `{"model":…, "yhead":…}` 字典。
 
 关键训练参数：
 
@@ -100,10 +99,10 @@ python -m scripts_control.03_train_predictor \
 | `--epochs` | 200 | 训练轮数 |
 | `--bs` | 16 | 批大小 |
 | `--lr` | 1e-3 | 初始学习率（AdamW, weight_decay=1e-4） |
-| `--horizon` | 32 | 预测视野 |
+| `--horizon` | 32 | （未使用，保留仅为兼容） |
 | `--n-state` | 16 | 线性 SS 状态维度 |
 | `--hidden` | 128 | 残差 MLP 隐藏层 |
-| `--tf-decay` | 50 | teacher forcing 衰减 epoch（1→0 线性衰减） |
+| `--tf-decay` | 50 | （已废弃，保留仅为兼容） |
 | `--patience` | 30 | 早停耐心 |
 | `--val-ratio` | 0.15 | 验证集比例 |
 
@@ -118,12 +117,12 @@ python -m scripts_control.03_train_predictor \
 
 ```bash
 python -m scripts_control.03_train_predictor \
-    --epochs 5 --bs 16 --tf-decay 2 --patience 5
+    --epochs 5 --bs 16 --patience 5
 ```
 
-### 步骤 3.5 — 训练 x1–x8 去噪/重构模型（可选）
+### 步骤 3.5 — 训练 x1–x8 多步外推预测模型（可选）
 
-默认模型只预测 y1–y4（x1–x8 是外生输入）。若要模型**也输出 x1–x8 的重构（降噪）值**，另训一个结构相同、输出维度换成 8 的独立模型（`SS_NN_Hybrid(dim_u=8, dim_y=8)`），输入是被污染（随机 mask + 噪声）的 x，目标是干净 x。**不影响 y 模型与 MPC。**
+默认模型只预测 y1–y4（x1–x8 是外生输入）。若要模型**也预测 x1–x8 的未来值**（多步外推），另训一个结构相同、输出维度换成 8 的独立模型（`SS_NN_Hybrid(dim_u=8, dim_y=8)`）：给定过去 C 步 x，预测未来 H 步 x。训练用 **teacher forcing**，推理用**真正的反馈自回归 rollout**（把模型自己上一时刻的预测喂回下一步）。**不影响 y 模型与 MPC。**
 
 ```bash
 # 加 --out-root 可把模型输出一键放进 scripts_control/（默认在项目根 checkpoints/、results/）
@@ -132,19 +131,20 @@ python -m scripts_control.08_train_x_model \
     --test  data/processed/test.npz  \
     --scalers data/processed/scalers.npz \
     --epochs 200 --bs 16 --lr 1e-3 \
-    --mask-prob 0.15 --noise-std 0.1 --patience 30 \
+    --context 32 --horizon 32 --tf-decay 50 --patience 30 \
     --out-root scripts_control
 ```
 
-- `--mask-prob` / `--noise-std`：训练时对 x 的随机 mask 比例 / 高斯噪声强度（去噪任务的污染强度）
+- `--context C` / `--horizon H`：上下文长度 / 外推步数——给定过去 C 步 x，预测未来 H 步（要求样本长度 ≥ C+H）
+- `--tf-decay`：teacher-forcing 衰减 epoch 数（1 → 0）；训练每 batch 50/50 混合 TF 与真自回归
 - `--out-root <dir>`：输出根目录，设置后模型输出统一放到 `<dir>/checkpoints`、`<dir>/results/metrics`、`<dir>/results/predictions`
 
 输出（默认 `checkpoints/`、`results/`；`--out-root scripts_control` 时为 `scripts_control/checkpoints/`、`scripts_control/results/`）：
-- `checkpoints/x_recon_best.pt`     —— 最佳验证集权重（存的是**裸 state_dict**）
-- `checkpoints/x_recon_last.pt`     —— 末 epoch 权重
-- `results/metrics/x_recon_training_log.json`
-- `results/metrics/x_recon_metrics.json`  —— 各 x 变量 MSE / MAE / R²
-- `results/predictions/test_x_predictions.npz`
+- `checkpoints/x_forecast_best.pt`     —— 最佳验证集权重（存的是**裸 state_dict**）
+- `checkpoints/x_forecast_last.pt`     —— 末 epoch 权重
+- `results/metrics/x_forecast_training_log.json`
+- `results/metrics/x_forecast_metrics.json`  —— 各 x 变量 MSE / MAE / R²
+- `results/predictions/test_x_forecast.npz`
 
 ### 步骤 4 — MPC Pareto 优化
 
@@ -191,7 +191,7 @@ python -m scripts_control.06_visualize \
 - `--out-root <dir>`：模型/产物查找根目录（与 08 的 `--out-root` 对应），`--ckpt`/`--x-ckpt`/`--preds`/`--pareto` 默认取 `<dir>/checkpoints/...`、`<dir>/results/...`；不传则用项目根 `checkpoints/`、`results/`
 
 输出（默认到 `src_control/analysis_out/`，可用 `--out-dir` 覆盖）：
-- `forecast_x1_x8.png`     —— 2 个测试样本的 x1..x8 历史 + x̂ 重构预测（若 x 模型存在则叠加红色虚线）；仅画 x，y 预测见下面独立图
+- `forecast_x1_x8.png`     —— 2 个测试样本的 x1..x8 历史 + 未来外推预测（若 x 模型存在则叠加红色虚线，浅灰点线为真实未来）；仅画 x，y 预测见下面独立图
 - `forecast_y1_y4.png`     —— y1..y4 历史 + 真实 vs 预测（仅 y 模型存在时）
 - `error_distribution.png` —— 残差直方图 + 真实-预测散点（含 MAE / RMSE / R²）
 - `optimization_compare.png` —— MPC 优化前后 y4 Σ 对比，Pareto 前沿高亮
@@ -238,7 +238,7 @@ pytest tests_control/
 | 训练 | `LR` | 1e-3 | 初始学习率 |
 |  | `BS` | 16 | 批大小 |
 |  | `EPOCHS` | 200 | 训练 epoch |
-|  | `TEACHER_FORCING_DECAY` | 50 | teacher forcing 衰减 epoch |
+|  | `TEACHER_FORCING_DECAY` | 50 | （已废弃） |
 |  | `PATIENCE` | 30 | 早停耐心 |
 | 优化 | `OPT_HORIZON` | 16 | MPC 预测视野 |
 |  | `OPT_N_STARTS` | 5 | 多起点数量（CLI `--n-starts` 默认 3） |

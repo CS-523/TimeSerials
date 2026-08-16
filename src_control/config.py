@@ -61,6 +61,7 @@ class Config:
     EPOCHS: int = 200
     TEACHER_FORCING_DECAY: int = 50
     ROLLOUT_HORIZON: int = 32
+    X_FORECAST_CONTEXT: int = 32   # context length for the x1–x8 forecaster
     PATIENCE: int = 30
     GRAD_CLIP: float = 1.0
     VAL_RATIO: float = 0.15

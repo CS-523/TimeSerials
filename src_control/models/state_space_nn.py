@@ -67,6 +67,21 @@ class LinearSSTorch(nn.Module):
             ys.append(y)
         return torch.stack(ys, dim=1)
 
+    def step(
+        self,
+        x: torch.Tensor,
+        u_t: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Single-step state update: ``(x, u_t) -> (x_next, y_t)``.
+
+        ``x`` is ``(B, n)`` current state; ``u_t`` is ``(B, m)``. Returns
+        ``x_next`` ``(B, n)`` and ``y_t`` ``(B, p)``. Factored out of
+        :meth:`rollout` so the state can be carried across a forecast horizon.
+        """
+        x_next = x @ self.A.T + u_t @ self.B.T
+        y_t = x_next @ self.C.T + u_t @ self.D.T
+        return x_next, y_t
+
 
 class ResidualMLP(nn.Module):
     """Residual MLP that maps a sliding window of (u, y_lin) → y_res.
@@ -112,6 +127,16 @@ class ResidualMLP(nn.Module):
             flat = window.reshape(B, w * d)
             outs.append(self.net(flat))
         return torch.stack(outs, dim=1)
+
+    def step(self, feat_window: torch.Tensor) -> torch.Tensor:
+        """Single-step application over a window of features.
+
+        ``feat_window`` is ``(B, window, dim_in)``; returns ``y_res`` of shape
+        ``(B, dim_out)``. This is the inner body of :meth:`forward`, factored
+        out for the autoregressive forecaster's rolling window.
+        """
+        B = feat_window.shape[0]
+        return self.net(feat_window.reshape(B, self.flatten_dim))
 
 
 class SS_NN_Hybrid(nn.Module):
@@ -213,6 +238,71 @@ class SS_NN_Hybrid(nn.Module):
         # Open-loop rollout: predict y_t given only y_lin (no y_prev available).
         return self.forward(u, y_prev=None, teacher_forcing=0.0)
 
+    def forecast(
+        self,
+        x_context: torch.Tensor,
+        horizon: int,
+        x_future_gt: Optional[torch.Tensor] = None,
+        teacher_forcing: float = 1.0,
+    ) -> torch.Tensor:
+        """Multi-step-ahead forecast with true autoregressive feedback.
+
+        Valid only when ``dim_u == dim_y`` (the x-as-input-and-target
+        forecaster). The input is reinterpreted as lagged by one step: at
+        forecast step ``k`` the model predicts ``x[s+k]`` using only
+        information available at time ``s+k-1``. The residual window's context
+        is the model's *own* previous prediction (``x_hat_prev``), so gradients
+        flow through the feedback path — genuine AR, not the open-loop
+        ``y_prev=None`` shortcut.
+
+        Parameters
+        ----------
+        x_context : (B, C, m) standardized past x (ground-truth context).
+        horizon : int, number of future steps H to predict.
+        x_future_gt : optional (B, H, p) ground-truth future x for teacher
+            forcing. When ``None``, pure AR feedback is used.
+        teacher_forcing : in [0, 1]; blends the previous-x fed to the model
+            between ground truth and the model's own previous prediction.
+
+        Returns
+        -------
+        x_hat : (B, H, p)
+        """
+        assert self.dim_u == self.dim_y, "forecast() requires dim_u == dim_y"
+        B, C, _ = x_context.shape
+        dev, dt = x_context.device, x_context.dtype
+        feat_dim = self.dim_u + 2 * self.dim_y
+
+        # Warm up the linear-SS state and residual window over the ground-truth
+        # context (lag-1: u_t = x_context[t-1]). Zero-init of ``feat_buf``
+        # reproduces ``ResidualMLP.forward``'s window-1 zero-padding exactly.
+        x_state = torch.zeros(B, self.linear.n, device=dev, dtype=dt)
+        feat_buf = torch.zeros(B, self.window, feat_dim, device=dev, dtype=dt)
+        for t in range(1, C):
+            u = x_context[:, t - 1, :]
+            x_state, y_lin = self.linear.step(x_state, u)
+            f = torch.cat([u, y_lin, u], dim=-1)
+            feat_buf = torch.cat([feat_buf[:, 1:, :], f.unsqueeze(1)], dim=1)
+
+        x_hat_prev = x_context[:, -1, :]
+        outs = []
+        for k in range(horizon):
+            if x_future_gt is not None:
+                x_gt_prev = x_context[:, -1, :] if k == 0 else x_future_gt[:, k - 1, :]
+                # Blend ground truth and own prediction (scheduled sampling);
+                # NOT detached so gradients flow through the feedback path.
+                u_k = teacher_forcing * x_gt_prev + (1.0 - teacher_forcing) * x_hat_prev
+            else:
+                u_k = x_hat_prev
+            x_state, y_lin = self.linear.step(x_state, u_k)
+            f = torch.cat([u_k, y_lin, u_k], dim=-1)
+            feat_buf = torch.cat([feat_buf[:, 1:, :], f.unsqueeze(1)], dim=1)
+            y_res = self.residual.step(feat_buf)
+            x_hat = y_lin + y_res
+            outs.append(x_hat)
+            x_hat_prev = x_hat
+        return torch.stack(outs, dim=1)
+
 
 class YHead(nn.Module):
     """Tiny MLP regressing final ``Y`` from the last-cycle y window.
@@ -303,7 +393,19 @@ def _selftest():
     yh = YHead(window=4)
     yh_pred = yh(torch.randn(3, 4, 4))
     assert yh_pred.shape == (3,), f"y-head shape mismatch: {yh_pred.shape}"
-    print("[selftest] SS_NN_Hybrid forward/rollout/YHead OK")
+
+    # Forecast (true AR feedback) — requires dim_u == dim_y.
+    x_model = SS_NN_Hybrid(dim_u=8, dim_y=8, n_state=8, hidden=32, window=3)
+    x_ctx = torch.randn(2, 6, 8)
+    x_hat = x_model.forecast(x_ctx, 4, x_future_gt=None, teacher_forcing=0.0)
+    assert x_hat.shape == (2, 4, 8), f"forecast shape mismatch: {x_hat.shape}"
+    assert torch.isfinite(x_hat).all(), "forecast produced NaN"
+    x_hat_tf = x_model.forecast(
+        x_ctx, 4, x_future_gt=torch.randn(2, 4, 8), teacher_forcing=0.5
+    )
+    assert x_hat_tf.shape == (2, 4, 8)
+    x_hat_tf.mean().backward()  # gradient flows through the feedback path
+    print("[selftest] SS_NN_Hybrid forward/rollout/forecast/YHead OK")
 
 
 if __name__ == "__main__":

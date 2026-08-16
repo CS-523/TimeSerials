@@ -7,9 +7,9 @@
 | 脚本 | 作用 | 产物 |
 |---|---|---|
 | `03_train_predictor.py` | 训练 y1–y4 预测模型（线性 SS + NN 残差） | `checkpoints/ss_nn_best.pt` 等 |
-| `08_train_x_model.py` | 训练独立的 x1–x8 去噪/重构模型 | `checkpoints/x_recon_best.pt` 等 |
+| `08_train_x_model.py` | 训练独立的 x1–x8 多步外推预测模型 | `checkpoints/x_forecast_best.pt` 等 |
 | `04_optimize.py` | MPC Pareto 优化（决策变量 x3/x4/x6/x8） | `results/metrics/pareto.json` 等 |
-| `06_visualize.py` | 综合可视化（y 预测 / x̂ 叠加，两者都可选） | `src_control/analysis_out/*.png` |
+| `06_visualize.py` | 综合可视化（y 预测 / x̂ 外推，两者都可选） | `src_control/analysis_out/*.png` |
 | `07_ppt_figures.py` | 生成 8 张中文标注的 PPT 图 | `src_control/analysis_out/ppt/*.png` |
 | `05_smoke_test.py` | 端到端冒烟测试（临时目录，几分钟） | 无（临时目录自动清理） |
 
@@ -33,28 +33,29 @@ python -m src_control.preprocess \
 
 ## 1. 训练 y 预测模型（x → y）
 
+模型为**纯 x → y 前馈**：只用外生输入 x1–x8 预测 y1–y4，无 teacher forcing、无 y 自回归反馈（`--tf-decay` 已废弃，保留仅为兼容）。
+
 ```bash
 python -m scripts_control.03_train_predictor \
-    --data  data/processed/train.npz \
-    --test  data/processed/test.npz  \
+    --data data/processed/train.npz \
+    --test data/processed/test.npz \
     --scalers data/processed/scalers.npz \
-    --epochs 200 --bs 16 --lr 1e-3 \
-    --tf-decay 50 --patience 30
+    --epochs 200 --bs 16 --lr 1e-3 --patience 30
 ```
 
-- 主要参数：`--n-state 16`（SS 状态维）、`--hidden 128`（残差 MLP）、`--horizon 32`
+- 主要参数：`--n-state 16`（SS 状态维）、`--hidden 128`（残差 MLP）
 - 产物：`checkpoints/ss_nn_best.pt` / `ss_nn_last.pt`、`results/metrics/training_log.json`、`results/metrics/test_metrics.json`、`results/predictions/test_predictions.npz`
 
 快速冒烟（CI）：
 
 ```bash
 python -m scripts_control.03_train_predictor \
-    --epochs 5 --bs 16 --tf-decay 2 --patience 5
+    --epochs 5 --bs 16 --patience 5
 ```
 
-## 2. 训练 x1–x8 去噪/重构模型（可选、独立）
+## 2. 训练 x1–x8 多步外推预测模型（可选、独立）
 
-默认模型只预测 y。若要**也让 x1–x8 有预测值**（去噪/缺失填补），另训一个输出维度换成 8 的独立模型，**不影响 y 模型与 MPC**：
+默认模型只预测 y。若要**也让 x1–x8 有未来预测值**（多步外推），另训一个输出维度换成 8 的独立模型——训练用 teacher forcing、推理用真正的自回归 rollout，**不影响 y 模型与 MPC**：
 
 ```bash
 # 加 --out-root 可把模型输出一键放进 scripts_control/（见下方说明）
@@ -63,16 +64,15 @@ python -m scripts_control.08_train_x_model \
     --test  data/processed/test.npz  \
     --scalers data/processed/scalers.npz \
     --epochs 200 --bs 16 --lr 1e-3 \
-    --mask-prob 0.15 --noise-std 0.1 --patience 30 
-	# \
-    #--out-root scripts_control
+    --context 32 --horizon 32 --tf-decay 50 --patience 30
 ```
 
-- `--mask-prob` / `--noise-std`：训练时对 x 的随机 mask 比例 / 高斯噪声强度（去噪任务的污染强度）
+- `--context C` / `--horizon H`：上下文长度 / 外推步数——给定过去 C 步 x，预测未来 H 步（要求样本长度 ≥ C+H）
+- `--tf-decay`：teacher-forcing 衰减 epoch 数（1 → 0）；训练每 batch 50/50 混合 TF 与真自回归
 - `--out-root <dir>`：输出根目录，设置后模型输出统一放到 `<dir>/checkpoints`、`<dir>/results/metrics`、`<dir>/results/predictions`（默认 `checkpoints/`、`results/`，与 03 一致）
-- 产物：`checkpoints/x_recon_best.pt`（裸 state_dict）、`results/metrics/x_recon_metrics.json`、`results/predictions/test_x_predictions.npz`（用 `--out-root scripts_control` 时为 `scripts_control/checkpoints/...` 等）
+- 产物：`checkpoints/x_forecast_best.pt`（裸 state_dict）、`results/metrics/x_forecast_metrics.json`、`results/predictions/test_x_forecast.npz`（用 `--out-root scripts_control` 时为 `scripts_control/checkpoints/...` 等）
 
-训练完成后即可加载做推理，详见下方「加载 x 模型做去噪/填补」。
+训练完成后即可加载做推理，详见下方「加载 x 模型做未来外推」。
 
 ## 3. MPC Pareto 优化
 
@@ -102,10 +102,11 @@ python -m scripts_control.06_visualize \
 
 - `--out-root <dir>`：模型/产物查找根目录，`--ckpt`/`--x-ckpt`/`--preds`/`--pareto` 默认取 `<dir>/checkpoints/...`、`<dir>/results/...`；与 08 训练脚本的 `--out-root` 对应，两侧用同一个目录即可
 - `--ckpt`（y 模型）默认 `<out-root>/checkpoints/ss_nn_best.pt`（不传 `--out-root` 时是 `checkpoints/ss_nn_best.pt`），缺失时跳过 `forecast_y1_y4.png`
-- `--x-ckpt`（x 模型）默认 `<out-root>/checkpoints/x_recon_best.pt`，缺失时跳过 x̂ 叠加
+- `--x-ckpt`（x 模型）默认 `<out-root>/checkpoints/x_forecast_best.pt`，缺失时跳过 x̂ 外推
+- `--context C` / `--horizon H`：x 外推的上下文长度 / 步数，需与 08 训练时一致（默认 32/32）
 - 两个都不存在则直接退出并提示；缺哪个都会在 stderr 打印 `WARNING` 并在末尾汇总
 - 产物（默认到 `src_control/analysis_out/`）：
-  - `forecast_x1_x8.png` — x1..x8 历史 + x̂ 重构预测（红色虚线）；仅画 x，y 预测在下面独立图里
+  - `forecast_x1_x8.png` — x1..x8 历史 + 未来外推预测（红色虚线，浅灰点线为真实未来）；仅画 x，y 预测在下面独立图里
   - `forecast_y1_y4.png`（仅 y 模型存在时）、`error_distribution.png`、`optimization_compare.png`
 
 ## 5. PPT 图
@@ -141,24 +142,27 @@ preprocess ──► 08 训练 x 模型 ─────────────�
 
 ---
 
-## 加载 x 模型做去噪/缺失填补（最小示例）
+## 加载 x 模型做未来外推（最小示例）
 
 ```python
 import numpy as np, torch
 from src_control.models.state_space_nn import SS_NN_Hybrid
 
 model = SS_NN_Hybrid(dim_u=8, dim_y=8, n_state=16, hidden=128, window=4)
-model.load_state_dict(torch.load("checkpoints/x_recon_best.pt", map_location="cpu"))
+model.load_state_dict(torch.load("checkpoints/x_forecast_best.pt", map_location="cpu"))
 model.eval()
 
 scaler = np.load("data/processed/scalers.npz")
 x_mean, x_scale = scaler["x_mean"], scaler["x_scale"]
 
-x_raw = ...                     # (T, 8) 原始单位的 x
-x_std = np.nan_to_num((x_raw - x_mean) / x_scale, nan=0.0)  # NaN(缺失) 当 0 喂入
+C, H = 32, 32                  # 与训练时的 --context/--horizon 一致
+x_raw = ...                    # (T, 8) 原始单位的 x，要求 T >= C + H
+x_std = (x_raw - x_mean) / x_scale
+s = x_raw.shape[0] - H         # 预测起点 = T - H
+ctx = x_std[s - C : s]         # 最近 C 步作为上下文
 
 with torch.no_grad():
-    x_hat = model(torch.tensor(x_std, dtype=torch.float32).unsqueeze(0),
-                  y_prev=None, teacher_forcing=0.0)
-x_hat = x_hat[0].cpu().numpy() * x_scale + x_mean   # 反标准化 → 去噪/填补后的 x1–x8
+    x_hat = model.forecast(torch.tensor(ctx, dtype=torch.float32).unsqueeze(0),
+                           H, x_future_gt=None, teacher_forcing=0.0)
+x_hat = x_hat[0].cpu().numpy() * x_scale + x_mean   # 反标准化 → 未来 H 步的 x1–x8 预测
 ```

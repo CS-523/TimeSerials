@@ -1,13 +1,12 @@
-"""Train an independent x1–x8 denoising/reconstruction model.
+"""Train an independent x1–x8 multi-step-ahead forecaster.
 
-Mirrors ``scripts_control.03_train_predictor``, but the prediction target is
-**x** instead of **y**. The model is ``SS_NN_Hybrid(dim_u=8, dim_y=8)`` —
-input = corrupted x (masked + noisy), output = clean x̂. The existing
-y-predictor / MPC pipeline is left untouched.
-
-The corruption at training time is what makes the task non-trivial: with a
-clean input the model would just learn the identity. Masking entries and
-adding noise teaches it to impute missing values and smooth anomalies.
+The model is ``SS_NN_Hybrid(dim_u=8, dim_y=8)`` with ``init_x_recon`` (identity
+D feedthrough), reinterpreted as a **lag-1 predictor**: given a context of past
+x, predict the next H future values of x1–x8. Training uses a teacher-forcing
+schedule (mirroring ``scripts_control.03_train_predictor``) with a 50/50
+teacher-forced / autoregressive split per batch; evaluation is a **true
+autoregressive rollout** — the model feeds its own previous prediction back at
+each step (``forecast(..., x_future_gt=None, teacher_forcing=0.0)``).
 
 Usage::
 
@@ -15,15 +14,16 @@ Usage::
         --data    data/processed/train.npz \
         --test    data/processed/test.npz \
         --scalers data/processed/scalers.npz \
-        --epochs 200 --bs 16 --lr 1e-3 --patience 30 
+        --epochs 200 --bs 16 --lr 1e-3 \
+        --context 32 --horizon 32 --tf-decay 50 --patience 30
 
 Outputs (under ``checkpoints/``, ``results/metrics/``, ``results/predictions/``):
 
-* ``checkpoints/x_recon_best.pt``  — best val-loss weights
-* ``checkpoints/x_recon_last.pt``  — final-epoch weights
-* ``results/metrics/x_recon_training_log.json`` — per-epoch losses
-* ``results/metrics/x_recon_metrics.json``       — per-x-variable MSE/MAE/R²
-* ``results/predictions/test_x_predictions.npz``  — x_true / x_pred / valid mask
+* ``checkpoints/x_forecast_best.pt``  — best val-AR weights (raw state_dict)
+* ``checkpoints/x_forecast_last.pt``  — final-epoch weights
+* ``results/metrics/x_forecast_training_log.json`` — per-epoch losses
+* ``results/metrics/x_forecast_metrics.json``       — per-x-variable MSE/MAE/R²
+* ``results/predictions/test_x_forecast.npz``  — x_true / x_pred / mask / context
 """
 from __future__ import annotations
 
@@ -47,22 +47,37 @@ X_NAMES = ("x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8")
 
 
 # --------------------------------------------------------------------------- #
-# Corruption & loss helpers
+# Forecast pair construction & loss helpers
 # --------------------------------------------------------------------------- #
-def corrupt_x(
-    x: torch.Tensor,
-    mask_prob: float,
-    noise_std: float,
-    gen: torch.Generator,
-) -> torch.Tensor:
-    """Zero out a random fraction of entries and add Gaussian noise.
+def build_forecast_tensors(
+    X: np.ndarray,
+    lengths: np.ndarray,
+    C: int,
+    H: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build (context, target) pairs anchored at each sample's tail.
 
-    ``x`` is ``(B, T, 8)`` on its device; ``gen`` must live on the same device.
+    ``X`` is ``(N, T, 8)`` standardized; ``lengths`` is ``(N,)``. For sample i
+    the forecast starts at ``s_i = L_i − H``; context is ``X[i, s_i−C : s_i]``
+    and target is ``X[i, s_i : s_i+H]``. Both are fully valid (no padding), and
+    the forecast lands exactly at the end of the sample. Samples shorter than
+    ``C + H`` are dropped.
+
+    Returns ``context`` ``(M, C, 8)``, ``target`` ``(M, H, 8)``, ``mask``
+    ``(M, H)`` (all-True by construction), and ``keep`` ``(N,)`` bool mask
+    marking which original samples were retained (to align ``file_ids``).
     """
-    mask = torch.rand(x.shape, generator=gen, device=x.device) < mask_prob
-    noise = torch.randn(x.shape, generator=gen, device=x.device) * noise_std
-    xc = torch.where(mask, torch.zeros_like(x), x.clone())
-    return xc + noise
+    s = lengths - H                       # (N,) forecast start per sample
+    keep = s - C >= 0                     # need a full context window
+    s = s[keep]
+    Xk = X[keep]
+    M = int(s.shape[0])
+    c_idx = s[:, None] - C + np.arange(C)[None, :]   # (M, C)
+    t_idx = s[:, None] + np.arange(H)[None, :]       # (M, H)
+    context = Xk[np.arange(M)[:, None], c_idx]       # (M, C, 8)
+    target = Xk[np.arange(M)[:, None], t_idx]        # (M, H, 8)
+    mask = np.ones((M, H), dtype=bool)
+    return context, target, mask, keep
 
 
 def masked_mse(pred: torch.Tensor, true: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -73,34 +88,32 @@ def masked_mse(pred: torch.Tensor, true: torch.Tensor, mask: torch.Tensor) -> to
     return diff.sum() / n
 
 
-def padding_mask(lengths: torch.Tensor, T: int) -> torch.Tensor:
-    """(B, T) bool mask: True for ``t < length[b]`` (non-padded positions)."""
-    idx = torch.arange(T, device=lengths.device)[None, :]
-    return idx < lengths[:, None]
-
-
 # --------------------------------------------------------------------------- #
 # Loaders
 # --------------------------------------------------------------------------- #
 def make_loaders(
-    train: dict,
+    context: np.ndarray,
+    target: np.ndarray,
+    mask: np.ndarray,
     val_ratio: float,
     seed: int,
     bs: int,
 ) -> tuple[DataLoader, DataLoader]:
-    N = train["X"].shape[0]
+    M = context.shape[0]
     rng = np.random.RandomState(seed)
-    perm = rng.permutation(N)
-    n_val = int(round(N * val_ratio))
+    perm = rng.permutation(M)
+    n_val = int(round(M * val_ratio))
     val_idx, tr_idx = perm[:n_val], perm[n_val:]
 
-    X_tr = torch.tensor(train["X"][tr_idx], dtype=torch.float32)
-    L_tr = torch.tensor(train["lengths"][tr_idx], dtype=torch.long)
-    X_va = torch.tensor(train["X"][val_idx], dtype=torch.float32)
-    L_va = torch.tensor(train["lengths"][val_idx], dtype=torch.long)
+    ctx_tr = torch.tensor(context[tr_idx], dtype=torch.float32)
+    tgt_tr = torch.tensor(target[tr_idx], dtype=torch.float32)
+    msk_tr = torch.tensor(mask[tr_idx], dtype=torch.float32)
+    ctx_va = torch.tensor(context[val_idx], dtype=torch.float32)
+    tgt_va = torch.tensor(target[val_idx], dtype=torch.float32)
+    msk_va = torch.tensor(mask[val_idx], dtype=torch.float32)
 
-    train_loader = DataLoader(TensorDataset(X_tr, L_tr), batch_size=bs, shuffle=True)
-    val_loader = DataLoader(TensorDataset(X_va, L_va), batch_size=bs, shuffle=False)
+    train_loader = DataLoader(TensorDataset(ctx_tr, tgt_tr, msk_tr), batch_size=bs, shuffle=True)
+    val_loader = DataLoader(TensorDataset(ctx_va, tgt_va, msk_va), batch_size=bs, shuffle=False)
     return train_loader, val_loader
 
 
@@ -127,8 +140,9 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--n-state", type=int, default=16)
     parser.add_argument("--hidden", type=int, default=128)
-    parser.add_argument("--mask-prob", type=float, default=0.15)
-    parser.add_argument("--noise-std", type=float, default=0.1)
+    parser.add_argument("--context", type=int, default=32)
+    parser.add_argument("--horizon", type=int, default=32)
+    parser.add_argument("--tf-decay", type=int, default=50)
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--patience", type=int, default=30)
     parser.add_argument("--seed", type=int, default=42)
@@ -154,18 +168,25 @@ def main() -> None:
     print("Loading data…")
     train = load_processed(args.data)
     test = load_processed(args.test)
-    T = train["X"].shape[1]
     print(f"  train X={train['X'].shape}, test X={test['X'].shape}, device={device}")
 
-    # Build x-reconstruction model (dim_u=8, dim_y=8) with identity-D warm start.
+    # Build x-forecaster (dim_u=8, dim_y=8) with persistence (identity-D) warm start.
     model = SS_NN_Hybrid(
         dim_u=8, dim_y=8, n_state=args.n_state, hidden=args.hidden, window=4
     )
     init_x_recon(model)
     model = model.to(device)
 
+    context, target, mask, _ = build_forecast_tensors(
+        train["X"], train["lengths"], args.context, args.horizon
+    )
+    n_dropped = train["X"].shape[0] - context.shape[0]
+    if context.shape[0] == 0:
+        raise RuntimeError("No sample is long enough for context+horizon; lower --context/--horizon.")
+    print(f"  forecast pairs: {context.shape[0]} (dropped {n_dropped} short samples)")
+
     train_loader, val_loader = make_loaders(
-        train, val_ratio=args.val_ratio, seed=args.seed, bs=args.bs
+        context, target, mask, val_ratio=args.val_ratio, seed=args.seed, bs=args.bs
     )
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -174,24 +195,30 @@ def main() -> None:
     )
 
     history = []
-    best_val = float("inf")
+    best_val_ar = float("inf")
     no_improve = 0
     t0 = time.time()
-    train_gen = torch.Generator(device=device).manual_seed(args.seed)
 
     for epoch in range(1, args.epochs + 1):
+        # Teacher-forcing schedule: 1 → 0 over tf_decay epochs
+        tf = max(0.0, 1.0 - epoch / max(1, args.tf_decay))
         model.train()
         ep_loss = 0.0
         n_batch = 0
-        for X, L in train_loader:
-            X = X.to(device)
-            L = L.to(device)
-            p_mask = padding_mask(L, T).unsqueeze(-1).expand(-1, -1, 8)
+        for ctx, tgt, msk in train_loader:
+            ctx = ctx.to(device)
+            tgt = tgt.to(device)
+            msk = msk.to(device)
+            msk3 = msk.unsqueeze(-1).expand(-1, -1, 8)   # (B, H, 8)
 
             optim.zero_grad()
-            x_corrupt = corrupt_x(X, args.mask_prob, args.noise_std, train_gen)
-            x_pred = model(x_corrupt, y_prev=None, teacher_forcing=0.0)
-            loss = masked_mse(x_pred, X, p_mask)
+            # 50% teacher-forced, 50% pure AR — robust to both regimes
+            use_tf = (torch.rand(1).item() < 0.5)
+            if use_tf:
+                x_hat = model.forecast(ctx, args.horizon, x_future_gt=tgt, teacher_forcing=tf)
+            else:
+                x_hat = model.forecast(ctx, args.horizon, x_future_gt=None, teacher_forcing=0.0)
+            loss = masked_mse(x_hat, tgt, msk3)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
@@ -200,67 +227,69 @@ def main() -> None:
         ep_loss /= max(1, n_batch)
         scheduler.step()
 
-        # Validation — deterministic corruption (fresh fixed seed each epoch)
+        # Validation — teacher-forced (val) and true-AR (val_ar)
         model.eval()
         val_loss = 0.0
+        val_ar_loss = 0.0
         n_v = 0
-        val_gen = torch.Generator(device=device).manual_seed(args.seed + 1)
         with torch.no_grad():
-            for X, L in val_loader:
-                X = X.to(device)
-                L = L.to(device)
-                p_mask = padding_mask(L, T).unsqueeze(-1).expand(-1, -1, 8)
-                x_corrupt = corrupt_x(X, args.mask_prob, args.noise_std, val_gen)
-                x_pred = model(x_corrupt, y_prev=None, teacher_forcing=0.0)
-                val_loss += float(masked_mse(x_pred, X, p_mask).item())
+            for ctx, tgt, msk in val_loader:
+                ctx = ctx.to(device)
+                tgt = tgt.to(device)
+                msk = msk.to(device)
+                msk3 = msk.unsqueeze(-1).expand(-1, -1, 8)
+                val_loss += float(masked_mse(
+                    model.forecast(ctx, args.horizon, x_future_gt=tgt, teacher_forcing=1.0),
+                    tgt, msk3,
+                ).item())
+                val_ar_loss += float(masked_mse(
+                    model.forecast(ctx, args.horizon, x_future_gt=None, teacher_forcing=0.0),
+                    tgt, msk3,
+                ).item())
                 n_v += 1
         val_loss /= max(1, n_v)
+        val_ar_loss /= max(1, n_v)
 
-        history.append({"epoch": epoch, "train": ep_loss, "val": val_loss})
-        if val_loss < best_val - 1e-6:
-            best_val = val_loss
+        history.append({"epoch": epoch, "train": ep_loss, "val": val_loss,
+                        "val_ar": val_ar_loss, "tf": tf})
+        # Model selection & early stop on true-AR (the deployment mode).
+        if val_ar_loss < best_val_ar - 1e-6:
+            best_val_ar = val_ar_loss
             no_improve = 0
-            torch.save(model.state_dict(), out_dir / "x_recon_best.pt")
-            print(f"  saved → {(out_dir / 'x_recon_best.pt').resolve()}")
+            torch.save(model.state_dict(), out_dir / "x_forecast_best.pt")
+            print(f"  saved → {(out_dir / 'x_forecast_best.pt').resolve()}")
         else:
             no_improve += 1
         if epoch % 5 == 0 or epoch == 1:
             elapsed = time.time() - t0
             print(f"  epoch {epoch:3d}/{args.epochs}  train={ep_loss:.4f}  "
-                  f"val={val_loss:.4f}  best_val={best_val:.4f}  ({elapsed:.0f}s)")
+                  f"val={val_loss:.4f}  val_ar={val_ar_loss:.4f}  tf={tf:.2f}  "
+                  f"best_val_ar={best_val_ar:.4f}  ({elapsed:.0f}s)")
         if no_improve >= args.patience:
             print(f"  early stop at epoch {epoch} (no improve for {args.patience} epochs)")
             break
 
-    torch.save(model.state_dict(), out_dir / "x_recon_last.pt")
-    print(f"  saved → {(out_dir / 'x_recon_last.pt').resolve()}")
-    (metrics_dir / "x_recon_training_log.json").write_text(json.dumps(history, indent=2))
-    print(f"  saved → {(metrics_dir / 'x_recon_training_log.json').resolve()}")
+    torch.save(model.state_dict(), out_dir / "x_forecast_last.pt")
+    print(f"  saved → {(out_dir / 'x_forecast_last.pt').resolve()}")
+    (metrics_dir / "x_forecast_training_log.json").write_text(json.dumps(history, indent=2))
+    print(f"  saved → {(metrics_dir / 'x_forecast_training_log.json').resolve()}")
 
     # ----------------------------------------------------------------------- #
-    # Test evaluation (deterministic corruption)
+    # Test evaluation (true autoregressive rollout)
     # ----------------------------------------------------------------------- #
     print("Evaluating on test set…")
-    model.load_state_dict(torch.load(out_dir / "x_recon_best.pt", map_location=device))
+    model.load_state_dict(torch.load(out_dir / "x_forecast_best.pt", map_location=device))
     model.eval()
 
-    Xt = torch.tensor(test["X"], dtype=torch.float32).to(device)
-    Lt = torch.tensor(test["lengths"], dtype=torch.long).to(device)
-    test_gen = torch.Generator(device=device).manual_seed(args.seed + 2)
-
-    all_preds = []
-    bs_eval = args.bs
+    ctx_t, tgt_t, msk_t, keep_t = build_forecast_tensors(
+        test["X"], test["lengths"], args.context, args.horizon
+    )
+    ctx_t_t = torch.tensor(ctx_t, dtype=torch.float32).to(device)
     with torch.no_grad():
-        for i in range(0, Xt.shape[0], bs_eval):
-            xb = Xt[i : i + bs_eval]
-            lb = Lt[i : i + bs_eval]
-            x_corrupt = corrupt_x(xb, args.mask_prob, args.noise_std, test_gen)
-            x_pred = model(x_corrupt, y_prev=None, teacher_forcing=0.0)
-            all_preds.append(x_pred.cpu().numpy())
-    x_pred_all = np.concatenate(all_preds, axis=0)
-    x_true_all = Xt.cpu().numpy()
+        x_pred = model.forecast(ctx_t_t, args.horizon, x_future_gt=None, teacher_forcing=0.0)
+    x_pred_all = x_pred.cpu().numpy()
 
-    # Denormalize into original x space (optional scaler)
+    # Denormalize into original x space
     scaler_path = Path(args.scalers)
     if not scaler_path.exists():
         scaler_path = Path(cfg.ROOT) / "data" / "processed" / "scalers.npz"
@@ -271,29 +300,29 @@ def main() -> None:
         x_mean = scaler["x_mean"]
         x_scale = scaler["x_scale"]
     x_pred_denorm = x_pred_all * x_scale + x_mean
-    x_true_denorm = x_true_all * x_scale + x_mean
+    x_true_denorm = tgt_t * x_scale + x_mean
 
-    # Valid mask (N, T, 8): non-padded positions, broadcast across channels.
-    lengths_np = Lt.cpu().numpy()
-    valid_2d = (np.arange(T)[None, :] < lengths_np[:, None]).astype(bool)
-    valid_3d = np.broadcast_to(valid_2d[..., None], (valid_2d.shape[0], T, 8)).copy()
+    mask_3d = np.broadcast_to(msk_t[..., None], (msk_t.shape[0], args.horizon, 8))
 
     per_var = per_variable_metrics(
-        x_true_denorm, x_pred_denorm, names=list(X_NAMES), mask=valid_3d
+        x_true_denorm, x_pred_denorm, names=list(X_NAMES), mask=mask_3d
     )
-    (metrics_dir / "x_recon_metrics.json").write_text(
+    (metrics_dir / "x_forecast_metrics.json").write_text(
         json.dumps({"per_variable": per_var}, indent=2)
     )
-    print(f"  saved → {(metrics_dir / 'x_recon_metrics.json').resolve()}")
+    print(f"  saved → {(metrics_dir / 'x_forecast_metrics.json').resolve()}")
 
+    start_idx = test["lengths"][keep_t] - args.horizon
     np.savez(
-        pred_dir / "test_x_predictions.npz",
+        pred_dir / "test_x_forecast.npz",
         x_true=x_true_denorm,
         x_pred=x_pred_denorm,
-        mask=valid_3d,
-        file_ids=test["file_ids"],
+        mask=msk_t,
+        context=ctx_t * x_scale + x_mean,
+        start_idx=start_idx,
+        file_ids=test["file_ids"][keep_t],
     )
-    print(f"  saved → {(pred_dir / 'test_x_predictions.npz').resolve()}")
+    print(f"  saved → {(pred_dir / 'test_x_forecast.npz').resolve()}")
     print(f"Test metrics: {json.dumps(per_var, indent=2)}")
     print("Done.")
 
