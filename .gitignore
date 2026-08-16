@@ -87,7 +87,9 @@ credentials.json
 /3/*.csv
 /4/*.csv
 /5/*.csv
-
+src/model_out_compare
+src/analysis_out
+src/model_out
 # 模型 checkpoint
 *.pt
 *.pth
