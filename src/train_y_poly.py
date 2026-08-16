@@ -209,8 +209,7 @@ def main():
         if args.alpha is not None:
             ridge = Ridge(alpha=args.alpha)
         else:
-            ridge = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 50.0, 100.0, 500.0, 1000.0],
-                            store_cv_values=True)
+            ridge = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 50.0, 100.0, 500.0, 1000.0])
         return Pipeline([("scaler", scaler), ("poly", poly), ("ridge", ridge)])
 
     if not args.per_group:

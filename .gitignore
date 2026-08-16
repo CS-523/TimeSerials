@@ -82,7 +82,7 @@ credentials.json
 
 # ===== Project: artifacts & cache =====
 # 原始数据（用户选 "只跟踪代码+文档"，原始 csv 仍保留在硬盘上不入库）
-/1/*.csv
+# /1/*.csv
 /2/*.csv
 /3/*.csv
 /4/*.csv
