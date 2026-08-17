@@ -45,6 +45,7 @@ import os
 import sys
 
 import numpy as np
+import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -191,6 +192,7 @@ def main():
     print(f"[viz] 可视化实验（{args.split}）: "
           f"{[f'G{e.group} {os.path.basename(e.file)}' for e in viz_exps]}")
 
+    forecast_rows = []
     fig, axes = plt.subplots(len(viz_exps), 8, figsize=(24, 4 * len(viz_exps)))
     if len(viz_exps) == 1:
         axes = axes[None, :]
@@ -228,6 +230,20 @@ def main():
         pred_full = out_dict["pred_x"][0].cpu().numpy() * x_scaler.std + x_scaler.mean
         pred_x = pred_full if args.tail_anchor else pred_full[pred_start - in_len:]
         x_future = exp.df[X_COLS].iloc[pred_start:pred_start + T_out].to_numpy(dtype=np.float32)
+        gname = int(exp.group)
+        fname = os.path.basename(exp.file)
+        for ti in range(x_hist.shape[0]):
+            forecast_rows.append({"group": gname, "file": fname, "t": ti,
+                                  "series": "history",
+                                  **dict(zip(X_COLS, x_hist[ti].tolist()))})
+        for j in range(T_out):
+            tt = pred_start + j
+            forecast_rows.append({"group": gname, "file": fname, "t": tt,
+                                  "series": "truth",
+                                  **dict(zip(X_COLS, x_future[j].tolist()))})
+            forecast_rows.append({"group": gname, "file": fname, "t": tt,
+                                  "series": "pred",
+                                  **dict(zip(X_COLS, pred_x[j].tolist()))})
         print(f"[viz] G{exp.group} {os.path.basename(exp.file)}: "
               f"input {input_start}-{pred_start - 1}, pred {pred_start}-{pred_start + T_out - 1}")
         for ci, c in enumerate(X_COLS):
@@ -249,6 +265,9 @@ def main():
     plt.savefig(os.path.join(out, f"forecast_x1_x8_{tag}.png"), dpi=120)
     plt.close()
     print(f"[viz] 写出 forecast_x1_x8_{tag}.png")
+    pd.DataFrame(forecast_rows, columns=["group", "file", "t", "series", *X_COLS]) \
+        .to_csv(os.path.join(out, f"forecast_x1_x8_{tag}.csv"), index=False)
+    print(f"[viz] 写出 forecast_x1_x8_{tag}.csv")
 
     # 2) 分维度 RMSE（现场重算，柱状图 + 数值）
     seed_off = {"train": 0, "val": 1, "test": 2}[args.split]
@@ -257,6 +276,9 @@ def main():
                                   return_by_group=True)
     per_dim_norm = np.array(metrics["rmse_x_per_dim_norm"])
     per_dim_orig = np.array(metrics["rmse_x_per_dim_orig"])
+    pd.DataFrame({"dim": X_COLS, "rmse_norm": per_dim_norm, "rmse_orig": per_dim_orig}) \
+        .to_csv(os.path.join(out, f"error_per_dim_{tag}.csv"), index=False)
+    print(f"[viz] 写出 error_per_dim_{tag}.csv")
     fig, axes = plt.subplots(1, 2, figsize=(14, 4))
     axes[0].bar(X_COLS, per_dim_norm, color="steelblue")
     axes[0].set_title(f"Per-dim RMSE(x), normalized space [{args.split}]  "

@@ -202,6 +202,8 @@ def plot_forecast_x(
     if n == 1:
         axes = axes[None, :]
 
+    payload: Dict[str, np.ndarray] = {"sample_indices": np.asarray(sample_indices)}
+
     for ei, idx in enumerate(sample_indices):
         X = test["X"][idx]
         T = int(test["lengths"][idx])
@@ -231,9 +233,17 @@ def plot_forecast_x(
             if ci == 0 and ei == 0:
                 ax.legend(fontsize=6, loc="upper left")
 
+        payload[f"file_id_{ei}"] = str(test["file_ids"][idx])
+        payload[f"T_{ei}"] = np.asarray(T)
+        payload[f"x_raw_{ei}"] = x_raw
+        payload[f"s_{ei}"] = np.asarray(s if s is not None else -1)
+        if res is not None:
+            payload[f"x_hat_{ei}"] = res[1]
+
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close(fig)
+    np.savez(str(Path(out_path).with_suffix(".npz")), **payload)
     print(f"[viz] wrote {out_path}")
 
 
@@ -263,6 +273,8 @@ def plot_forecast_y(
     fig, axes = plt.subplots(n, 4, figsize=(16, 3.2 * n), sharex=True)
     if n == 1:
         axes = axes[None, :]
+
+    payload: Dict[str, np.ndarray] = {"sample_indices": np.asarray(sample_indices)}
 
     for ei, idx in enumerate(sample_indices):
         X = test["X"][idx]
@@ -298,9 +310,17 @@ def plot_forecast_y(
             if yi == 0 and ei == 0:
                 ax.legend(fontsize=7, loc="upper left")
 
+        payload[f"file_id_{ei}"] = str(test["file_ids"][idx])
+        payload[f"T_{ei}"] = np.asarray(T)
+        payload[f"x_raw_{ei}"] = x_raw
+        payload[f"y_raw_{ei}"] = y_raw
+        payload[f"y_pred_{ei}"] = y_pred
+        payload[f"y_mask_{ei}"] = Y_mask[:T].astype(bool)
+
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close(fig)
+    np.savez(str(Path(out_path).with_suffix(".npz")), **payload)
     print(f"[viz] wrote {out_path}")
 
 
@@ -318,6 +338,11 @@ def plot_error_distribution(
     mask = data["mask"].astype(bool)
     y_names = ("y1", "y2", "y3", "y4")
 
+    payload: Dict[str, np.ndarray] = {}
+    mae_vals = []
+    rmse_vals = []
+    r2_vals = []
+
     fig, axes = plt.subplots(2, 4, figsize=(20, 8))
     for j, name in enumerate(y_names):
         yt = y_true[..., j].ravel()
@@ -325,6 +350,10 @@ def plot_error_distribution(
         m = mask[..., j].ravel()
         yt_obs, yp_obs = yt[m], yp[m]
         resid = yp_obs - yt_obs
+
+        payload[f"{name}_true_obs"] = yt_obs
+        payload[f"{name}_pred_obs"] = yp_obs
+        payload[f"{name}_resid"] = resid
 
         ax_h = axes[0, j]
         ax_h.hist(resid, bins=40, color="#4C72B0", alpha=0.7, edgecolor="black")
@@ -342,15 +371,23 @@ def plot_error_distribution(
         lim_hi = max(yt_obs.max(), yp_obs.max())
         ax_s.plot([lim_lo, lim_hi], [lim_lo, lim_hi], "k--", lw=1, alpha=0.5)
         r2_v = r2(yt_obs, yp_obs)
+        mae_vals.append(mae_v)
+        rmse_vals.append(rmse_v)
+        r2_vals.append(r2_v)
         ax_s.set_title(f"{name} — truth vs pred  (R²={r2_v:.3f})", fontsize=9)
         ax_s.set_xlabel("y_true")
         ax_s.set_ylabel("y_pred")
         ax_s.grid(True, alpha=0.3)
 
+    payload["mae"] = np.asarray(mae_vals)
+    payload["rmse"] = np.asarray(rmse_vals)
+    payload["r2"] = np.asarray(r2_vals)
+
     plt.suptitle("Final fit error analysis (test set)", fontsize=12, y=1.02)
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+    np.savez(str(Path(out_path).with_suffix(".npz")), **payload)
     print(f"[viz] wrote {out_path}")
 
 

@@ -280,6 +280,18 @@ def main() -> None:
                 y4_mask=m,
                 bounds=control_bounds_raw,
             )
+            np.savez(
+                out_dir / f"optimized_vs_baseline_{i}.npz",
+                x_default_raw=x_default_raw,
+                x_opt_raw=x_opt_raw,
+                x_truth_raw=x_truth_raw,
+                y4_default_raw=y4_default_raw,
+                y4_opt_raw=y4_opt_raw,
+                y4_truth=y4_truth,
+                y4_mask=m,
+                bounds=np.asarray(control_bounds_raw),
+                file_id=str(file_ids[i]),
+            )
 
     gains = np.array([r["gain_raw"] for r in results], dtype=np.float64)
     summary = {
