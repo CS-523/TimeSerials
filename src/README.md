@@ -368,6 +368,9 @@ python src/analyze.py \
 - **本版本不预测 y1-y4 / Y**——理由是 y 标签稀疏（y4 每 ~24 步一次），引入 y 头会拖累训练稳定性；
 - 训练损失 = `MSE(x)`。
 
+> 完整原理（动作来源、三重稳定化公式、与 StableGatedPI 的差异）见
+> [path_integrator_principle.md](path_integrator_principle.md)。
+
 ### 控制优化（[optimize.py](optimize.py)，本轮暂停）
 
 暂不启用——等 x 预测稳定后再补回 y 奖励机制。可能的方向：
