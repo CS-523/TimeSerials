@@ -117,3 +117,15 @@ results/optimization/
 src/model_out/forecaster_best.pt
 src/model_out/test_predictions.npz
 src/model_out/scalers.npz
+
+# ===== 跟踪 4 项任务的最终产出权重 =====
+# 任务 1：4 个多组预测模型（forecaster_*.pt 之前被 *.pt 忽略）
+!src/model_out/forecaster_lstm_shared.pt
+!src/model_out/forecaster_lstm_group_head.pt
+!src/model_out/forecaster_pathint_shared.pt
+!src/model_out/forecaster_pathint_group_head.pt
+# 任务 3：多项式 Ridge 模型（y_poly_*.pkl 之前被 src/model_out 忽略）
+!src/model_out/y_poly_*.pkl
+# 任务 2 / 4：SS_NN_Hybrid 预测器（之前被 checkpoints/ 忽略）
+!checkpoints/ss_nn_best.pt
+!checkpoints/x_forecast_best.pt
