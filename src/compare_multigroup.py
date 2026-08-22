@@ -59,7 +59,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from data_loader import load_all, sample_windows, Scaler, X_COLS
+from data_loader import load_all, sample_windows, Scaler, YScaler, X_COLS
 from model_lstm import LSTMForecaster
 from model_forecaster import PathIntegratorForecaster
 from model_multigroup import (
@@ -142,7 +142,7 @@ def train_one_epoch(model, loader, opt, device, mode: str, use_tf: bool = False)
 
 
 def train_model(model, train_loader, val_loader, device, args,
-                mode: str, ckpt_path: str, x_scaler, lr: float,
+                mode: str, ckpt_path: str, x_scaler, y_scaler, lr: float,
                 log_dir: str | None = None):
     """两阶段训练：Teacher Forcing (破冰) → 纯自回归 (抗压纠偏)。"""
     n_params = sum(p.numel() for p in model.parameters())
@@ -332,6 +332,16 @@ def main():
 
     x_scaler = Scaler.fit(train_exps)
     print(f"x_scaler std mean = {x_scaler.std.mean():.4f}")
+    # 与任务 2 一致：在全量（train+val+test）实验上 fit y_scaler
+    # y 是稀疏中间目标，train-only 样本可能太少；任务 2 的 fit_scalers 也用全量
+    all_exps_for_y = train_exps + val_exps + test_exps
+    y_scaler = YScaler.fit(all_exps_for_y)
+    print(f"y_scaler means={y_scaler.means.round(3).tolist()}, "
+          f"stds={y_scaler.stds.round(3).tolist()}")
+    # 落盘 y_scaler（与 x_scaler 落盘风格一致）
+    np.savez(os.path.join(args.out_dir, "scalers_y.npz"),
+             y_mean=y_scaler.means, y_scale=y_scaler.stds)
+    print(f"y_scaler 落盘: {os.path.join(args.out_dir, 'scalers_y.npz')}")
 
     train_samples = sample_windows(train_exps, rng_seed=args.seed)
     val_samples = sample_windows(val_exps, rng_seed=args.seed + 1)
