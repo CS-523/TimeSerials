@@ -346,9 +346,9 @@ def main():
     attach(test_samples, test_exps)
     print(f"样本: train={len(train_samples)}, val={len(val_samples)}, test={len(test_samples)}")
 
-    train_ds = WindowXGDataset(train_samples, x_scaler)
-    val_ds = WindowXGDataset(val_samples, x_scaler)
-    test_ds = WindowXGDataset(test_samples, x_scaler)
+    train_ds = WindowXGDataset(train_samples, x_scaler, y_scaler)
+    val_ds = WindowXGDataset(val_samples, x_scaler, y_scaler)
+    test_ds = WindowXGDataset(test_samples, x_scaler, y_scaler)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               collate_fn=pad_collate_xg, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
@@ -399,7 +399,7 @@ def main():
             else:
                 lr = args.lr_pathint
             n_params = train_model(model, train_loader, val_loader, device, args,
-                                   mode, ckpt_path, x_scaler, lr,
+                                   mode, ckpt_path, x_scaler, y_scaler, lr,
                                    log_dir=model_log_dir)
 
         # 加载最佳 ckpt 并评估

@@ -79,12 +79,18 @@ def split_experiments_groupwise(
     return train, val, test
 
 
-# ===================== 2. 数据集（带 group_id） =====================
+# ===================== 2. 数据集（带 group_id，可选 y 归一化） =====================
 class WindowXGDataset(Dataset):
-    """带 group_id 的窗口数据集（pooled / film 模式使用）。"""
-    def __init__(self, samples, x_scaler: Scaler):
+    """带 group_id 的窗口数据集（pooled / film 模式使用）。
+
+    y_scaler 为 None 时：与旧版完全一致（不归一化 y，仅返回原始 y_in/y_out/Y）；
+    y_scaler 不为 None 时：额外返回 y_in_norm / y_out_norm / y_mask（与任务 2
+    src_control/preprocess.py:175 的 apply_scalers 行为一致：缺失位用 0 填）。
+    """
+    def __init__(self, samples, x_scaler: Scaler, y_scaler=None):
         self.samples = samples
         self.xs = x_scaler
+        self.ys = y_scaler
 
     def __len__(self):
         return len(self.samples)
@@ -93,17 +99,30 @@ class WindowXGDataset(Dataset):
         s = self.samples[idx]
         x_in = self.xs.transform(s.x_in)
         x_out = self.xs.transform(s.x_out)
-        return {
+        item = {
             "x_in": torch.from_numpy(x_in).float(),
             "x_out": torch.from_numpy(x_out).float(),
             "in_len": s.in_len,
             "out_len": s.out_len,
             "group_id": int(s.group),  # attach_group 已转为 0..4
         }
+        if self.ys is not None:
+            y_in = s.y_in.astype(np.float32)
+            y_out = s.y_out.astype(np.float32)
+            y_in_mask = (~np.isnan(y_in)).astype(np.float32)
+            y_out_mask = (~np.isnan(y_out)).astype(np.float32)
+            # NaN 位先置 0 再 transform（与 apply_scalers 一致）
+            y_in_filled = np.nan_to_num(y_in, nan=0.0)
+            y_out_filled = np.nan_to_num(y_out, nan=0.0)
+            item["y_in"] = torch.from_numpy(self.ys.transform(y_in_filled)).float()
+            item["y_out"] = torch.from_numpy(self.ys.transform(y_out_filled)).float()
+            item["y_in_mask"] = torch.from_numpy(y_in_mask).float()
+            item["y_out_mask"] = torch.from_numpy(y_out_mask).float()
+        return item
 
 
 def pad_collate_xg(batch):
-    """变长样本 pad，带 group_id。"""
+    """变长样本 pad，带 group_id；若有 y 字段则一并 pad。"""
     max_in = max(b["in_len"] for b in batch)
     max_out = max(b["out_len"] for b in batch)
     B = len(batch)
@@ -112,14 +131,29 @@ def pad_collate_xg(batch):
     in_lens = torch.zeros(B, dtype=torch.long)
     out_lens = torch.zeros(B, dtype=torch.long)
     group_ids = torch.zeros(B, dtype=torch.long)
+    has_y = "y_in" in batch[0]
+    if has_y:
+        y_in = torch.zeros(B, max_in, 4)
+        y_out = torch.zeros(B, max_out, 4)
+        y_in_mask = torch.zeros(B, max_in, 4)
+        y_out_mask = torch.zeros(B, max_out, 4)
     for i, b in enumerate(batch):
         x_in[i, :b["in_len"]] = b["x_in"]
         x_out[i, :b["out_len"]] = b["x_out"]
         in_lens[i] = b["in_len"]
         out_lens[i] = b["out_len"]
         group_ids[i] = b["group_id"]
-    return dict(x_in=x_in, x_out=x_out, in_lens=in_lens, out_lens=out_lens,
-                group_ids=group_ids)
+        if has_y:
+            y_in[i, :b["in_len"]] = b["y_in"]
+            y_out[i, :b["out_len"]] = b["y_out"]
+            y_in_mask[i, :b["in_len"]] = b["y_in_mask"]
+            y_out_mask[i, :b["out_len"]] = b["y_out_mask"]
+    out = dict(x_in=x_in, x_out=x_out, in_lens=in_lens, out_lens=out_lens,
+               group_ids=group_ids)
+    if has_y:
+        out.update(y_in=y_in, y_out=y_out,
+                   y_in_mask=y_in_mask, y_out_mask=y_out_mask)
+    return out
 
 
 # ===================== 3. 训练 / 评估 =====================

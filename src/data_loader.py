@@ -92,27 +92,74 @@ def _align_to_period(df: pd.DataFrame) -> pd.DataFrame:
     return x_rows
 
 
-# ===================== 3. 清洗异常 =====================
+# ===================== 3. 异常清洗（z-score 标记 + 线性插值） =====================
+# 旧版用 IQR×3 clip，仅"压低幅度"，形状仍是尖刺；LSTM 仍要拟合 0.20→0.35→0.19
+# 这种 75% 跳变，N4SID 的 Hankel 矩阵被"接近边界"行主导。
+# 新版用 |z|>5 标记为 NaN + 线性插值，把尖刺"完全替换"为邻居均值，符合
+# "工业过程连续平滑"物理假设。N4SID 才能正确识别低秩动态。
+Z_THRESHOLD = 5.0  # 与任务 2 一致（src_control/preprocess.py:48）
+
+
+def detect_anomalies_x(df: pd.DataFrame, z_threshold: float = Z_THRESHOLD,
+                       max_iter: int = 3) -> pd.DataFrame:
+    """对每列 x 用 |z|>z_threshold 标记异常（z 由该列有效值 mean/std 算），返回 (T,8) bool。
+
+    使用 **迭代 trim**（最多 max_iter 轮）：每一轮重新计算 mean/std
+    时排除已标记的异常位，避免极端值（如 9999）主导 mean 让自身
+    |z| < threshold 而漏检。任务 2 的单遍实现对极短序列会漏检，
+    此处兼容之。
+    """
+    out = pd.DataFrame(False, index=df.index, columns=X_COLS)
+    for c in X_COLS:
+        col = df[c]
+        valid = col.notna().to_numpy()
+        if valid.sum() < 2:
+            continue
+        v = col.to_numpy(dtype=np.float64).copy()
+        idx_valid = np.where(valid)[0]
+        outlier = np.zeros_like(valid)
+        for _ in range(max_iter):
+            mu = v[idx_valid].mean()
+            sd = v[idx_valid].std() + 1e-6
+            z = np.zeros_like(v)
+            z[idx_valid] = (v[idx_valid] - mu) / sd
+            new_outlier = (np.abs(z) > z_threshold) & valid
+            if new_outlier.sum() == outlier.sum() and np.array_equal(new_outlier, outlier):
+                break
+            outlier = new_outlier
+            idx_valid = np.where(valid & ~outlier)[0]
+            if len(idx_valid) < 2:
+                break
+        out[c] = outlier
+    return out
+
+
 def _clean_anomalies(df: pd.DataFrame) -> pd.DataFrame:
     """
-    清洗策略：
-    - x 行内插（前向 + 后向）
-    - y 行缺失保留为 NaN（训练时掩码）
-    - 异常值用 IQR 法裁剪（每列单独看）
+    清洗策略（与任务 2 保持一致）：
+    - x 异常值：|z|>5 标记为 NaN，再用 np.interp 在 valid 索引间线性内插
+    - y 缺失：保留为 NaN（训练时用掩码）
     """
     df = df.copy()
-    # 异常值裁剪
+    # 1. 标记 x 异常：用 numpy 修改列（避免 .loc[..., col] / .to_numpy() 在某些
+    #    pandas 版本下触发 "assignment destination is read-only"）。
+    mask = detect_anomalies_x(df)
     for c in X_COLS:
-        s = df[c]
-        if s.notna().sum() < 5:
+        col = df[c].to_numpy(dtype=np.float64).copy()
+        col[mask[c].to_numpy(dtype=bool)] = np.nan
+        df[c] = col
+    # 2. 线性插值（按周期顺序，valid 索引间）
+    for c in X_COLS:
+        col = df[c].to_numpy(dtype=np.float64).copy()
+        valid = ~np.isnan(col)
+        if not valid.any():
+            df[c] = 0.0
             continue
-        q1, q3 = s.quantile(0.25), s.quantile(0.75)
-        iqr = q3 - q1
-        lo = q1 - 3 * iqr
-        hi = q3 + 3 * iqr
-        df[c] = s.clip(lo, hi)
-    # x 行内插（按周期顺序）
-    df[X_COLS] = df[X_COLS].interpolate(method="linear", limit_direction="both")
+        if valid.all():
+            continue
+        idx = np.arange(len(col))
+        col[~valid] = np.interp(idx[~valid], idx[valid], col[valid])
+        df[c] = col
     return df
 
 
